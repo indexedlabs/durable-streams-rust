@@ -236,6 +236,12 @@ no-redirect HTTP client while retaining the hostname for TLS SNI and `Host`.
 Plain HTTP and loopback targets are rejected unless the explicit localhost
 development flag is set.
 
+In `wal` mode the server binds a loopback `--host` by default and expects the access sidecar
+(DS-02) to own every external connection. A deployment that runs the server on a private
+network and enforces access with network policy instead can pass `--allow-non-loopback-host`
+to bind that address directly; the flag only lifts the bind-address guard and never adds
+authentication, TLS, or policy of its own.
+
 Durable: in `wal` mode (the default), an append returns only after its record is durable in the sharded write-ahead log (WAL). The WAL acks on a group-commit `fdatasync` and recovers cleanly on restart: every WAL record carries both a header CRC32C (torn-header detector — a partially-written header fails immediately) and a payload CRC32C verified on recovery, so no torn or zeroed record is ever replayed. State survives restarts — on boot the store rebuilds every stream from its data file plus a `.meta` sidecar, re-links fork chains, and replays the WAL to reconcile any un-checkpointed tail. (Crash window per [PROTOCOL.md](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md): producer dedup state may lag the data file, so producers should bump their epoch on restart.)
 
 In `memory` mode there is no WAL and no WAL replay. Recovery is a sidecar pass: each stream is rebuilt from its per-stream data file and `.meta` sidecar; durability is delegated to (future) replication.

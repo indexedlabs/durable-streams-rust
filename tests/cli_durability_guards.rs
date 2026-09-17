@@ -842,3 +842,45 @@ fn memory_without_an_explicit_data_dir_still_starts() {
         "memory mode must not be caught by the wal data-dir guard"
     );
 }
+
+#[test]
+fn wal_refuses_a_non_loopback_host_unless_explicitly_allowed() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-guard-wal-non-loopback-refused");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+
+    let mut args = wal_args(&dir, "14973");
+    args.extend(["--host", "0.0.0.0"].map(str::to_string));
+    let out = server().args(&args).output().expect("spawn");
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("WAL pilot mode requires a loopback --host")
+            && stderr.contains("--allow-non-loopback-host"),
+        "the refusal must name the opt-in flag, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_binds_a_non_loopback_host_when_explicitly_allowed() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-guard-wal-non-loopback-allowed");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+
+    let server = ServerUnderTest::wal(&dir, &["--host", "0.0.0.0", "--allow-non-loopback-host"]);
+    let response = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    // Readiness is 200, or 503 when the test filesystem is under the reserve
+    // floor; either proves the guard was lifted and the server is serving.
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
+        "a WAL server bound to 0.0.0.0 with the opt-in flag must serve readiness, got: {response}"
+    );
+    assert!(
+        response.contains("\"contract_version\":\"durable-streams-store-ready-v1\""),
+        "{response}"
+    );
+    let _ = server.port();
+}

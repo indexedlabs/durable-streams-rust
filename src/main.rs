@@ -253,6 +253,11 @@ fn main() {
     // (PROTOCOL.md §5.6). `None` ⇒ the 4 MiB default; `0` ⇒ unlimited (one response
     // per remaining byte range, the pre-cap behaviour).
     let mut max_chunk_bytes: Option<u64> = None;
+    // WAL mode binds loopback by default and expects the DS-02 access sidecar to own
+    // external exposure. Deployments that place the server on a private network
+    // and enforce access at the network layer opt in explicitly to a non-loopback
+    // bind; the flag never changes what the server does with a request.
+    let mut allow_non_loopback_host = false;
     let mut args = raw_args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -395,6 +400,9 @@ fn main() {
             }
             "--tier-allow-http" => {
                 tier.allow_http = true;
+            }
+            "--allow-non-loopback-host" => {
+                allow_non_loopback_host = true;
             }
             "--wal-shards" => {
                 let n: usize = parse_val(args.next(), "--wal-shards");
@@ -584,8 +592,11 @@ fn main() {
                 "WAL pilot reserve cannot be lowered below {DEFAULT_MINIMUM_FREE_BYTES} bytes and {DEFAULT_MINIMUM_FREE_INODES} inodes"
             ));
         }
-        if !host.is_loopback() {
-            exit_usage("WAL pilot mode requires a loopback --host; DS-02 owns external access");
+        if !host.is_loopback() && !allow_non_loopback_host {
+            exit_usage(
+                "WAL pilot mode requires a loopback --host; DS-02 owns external access \
+                 (pass --allow-non-loopback-host to bind a private network address directly)",
+            );
         }
         let expected = store_manifest::ExpectedStoreIdentityV1 {
             store_id: expected_store_id

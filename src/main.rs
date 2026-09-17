@@ -594,8 +594,9 @@ fn main() {
         }
         if !host.is_loopback() && !allow_non_loopback_host {
             exit_usage(
-                "WAL pilot mode requires a loopback --host; DS-02 owns external access \
-                 (pass --allow-non-loopback-host to bind a private network address directly)",
+                "WAL mode requires a loopback --host by default; pass \
+                 --allow-non-loopback-host only when external access to this server is \
+                 enforced outside it (an access sidecar or network policy)",
             );
         }
         let expected = store_manifest::ExpectedStoreIdentityV1 {

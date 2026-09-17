@@ -843,11 +843,22 @@ fn memory_without_an_explicit_data_dir_still_starts() {
     );
 }
 
+/// Removes a fixture directory during unwinding too, so a failing assertion
+/// does not leave the fixed temp path behind for the next run.
+struct FixtureDir(std::path::PathBuf);
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn wal_refuses_a_non_loopback_host_unless_explicitly_allowed() {
     let dir = std::env::temp_dir().join("ds-rust-cli-guard-wal-non-loopback-refused");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
+    let _guard = FixtureDir(dir.clone());
 
     let mut args = wal_args(&dir, "14973");
     args.extend(["--host", "0.0.0.0"].map(str::to_string));
@@ -856,11 +867,10 @@ fn wal_refuses_a_non_loopback_host_unless_explicitly_allowed() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("WAL pilot mode requires a loopback --host")
+        stderr.contains("WAL mode requires a loopback --host")
             && stderr.contains("--allow-non-loopback-host"),
         "the refusal must name the opt-in flag, got: {stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -259,21 +259,36 @@ mod tests {
     }
 
     #[test]
-    fn reserve_failed_readiness_is_503_and_never_ready() {
-        *TEST_FILESYSTEM_FREE.lock().unwrap() = Some((1, 1));
+    fn readiness_obeys_configured_reserve() {
+        const MINIMUM_BYTES: u64 = 64 * 1024 * 1024;
+        const MINIMUM_INODES: u64 = 1_000;
         let readiness = AdminReadiness::new(
             manifest(),
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            2,
-            2,
+            MINIMUM_BYTES,
+            MINIMUM_INODES,
         );
         readiness.ready();
-        let (status, body) = readiness.json(std::path::Path::new("."));
-        *TEST_FILESYSTEM_FREE.lock().unwrap() = None;
-        assert_eq!(status, 503);
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["status"], "starting");
-        assert_eq!(body["recovery"]["completed"], true);
-        assert_eq!(body["reserve"]["satisfied"], false);
+        for (free_bytes, free_inodes, satisfied) in [
+            // Well below production defaults, but above the test reserve.
+            (128 * 1024 * 1024, 2_000, true),
+            (MINIMUM_BYTES, MINIMUM_INODES, true),
+            (MINIMUM_BYTES - 1, MINIMUM_INODES, false),
+            (MINIMUM_BYTES, MINIMUM_INODES - 1, false),
+            (1, 1, false),
+        ] {
+            *TEST_FILESYSTEM_FREE.lock().unwrap() = Some((free_bytes, free_inodes));
+            let (status, body) = readiness.json(std::path::Path::new("."));
+            *TEST_FILESYSTEM_FREE.lock().unwrap() = None;
+            assert_eq!(status, if satisfied { 200 } else { 503 });
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["status"], if satisfied { "ready" } else { "starting" });
+            assert_eq!(body["recovery"]["completed"], true);
+            assert_eq!(body["reserve"]["free_bytes"], free_bytes);
+            assert_eq!(body["reserve"]["free_inodes"], free_inodes);
+            assert_eq!(body["reserve"]["minimum_free_bytes"], MINIMUM_BYTES);
+            assert_eq!(body["reserve"]["minimum_free_inodes"], MINIMUM_INODES);
+            assert_eq!(body["reserve"]["satisfied"], satisfied);
+        }
     }
 }

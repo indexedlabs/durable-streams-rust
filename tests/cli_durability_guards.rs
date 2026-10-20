@@ -76,10 +76,6 @@ fn wal_args(dir: &std::path::Path, port: &str) -> Vec<String> {
         "1",
         "--stream-lanes",
         "1",
-        "--minimum-free-bytes",
-        "21474836480",
-        "--minimum-free-inodes",
-        "10000",
     ]
     .iter()
     .map(|value| value.to_string())
@@ -268,6 +264,10 @@ fn wal_identity_mismatches_refuse_before_store_or_wal_mutation() {
     ] {
         let mut args = wal_args(&dir, "14978");
         replace_arg(&mut args, flag, value);
+        // Lowering readiness reserves must not relax store identity checks.
+        args.extend(
+            ["--minimum-free-bytes", "0", "--minimum-free-inodes", "0"].map(str::to_string),
+        );
         let out = server().args(args).output().expect("mismatched startup");
         assert_eq!(out.status.code(), Some(2), "{flag}");
         assert!(!dir.join("wal").exists(), "{flag} opened WAL");
@@ -277,17 +277,77 @@ fn wal_identity_mismatches_refuse_before_store_or_wal_mutation() {
 }
 
 #[test]
-fn wal_reserve_floor_cannot_be_lowered() {
-    let dir = std::env::temp_dir().join("ds-rust-cli-reserve-floor");
-    let _ = std::fs::remove_dir_all(&dir);
-    bootstrap(&dir);
-    let mut args = wal_args(&dir, "14979");
-    replace_arg(&mut args, "--minimum-free-bytes", "0");
-    let out = server().args(args).output().expect("startup");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("reserve"));
-    assert!(!dir.join("wal").exists());
-    let _ = std::fs::remove_dir_all(&dir);
+fn wal_readiness_keeps_default_reserves_without_flags() {
+    assert_wal_reserve(&[], 21_474_836_480, 10_000);
+}
+
+#[test]
+fn wal_readiness_accepts_explicit_lower_reserves() {
+    // Each flag changes only its own threshold; zero is also an explicit opt-in.
+    assert_wal_reserve(&["--minimum-free-bytes", "67108864"], 67_108_864, 10_000);
+    assert_wal_reserve(&["--minimum-free-inodes", "1000"], 21_474_836_480, 1_000);
+    assert_wal_reserve(
+        &[
+            "--minimum-free-bytes",
+            "67108864",
+            "--minimum-free-inodes",
+            "1000",
+        ],
+        67_108_864,
+        1_000,
+    );
+    assert_wal_reserve(
+        &["--minimum-free-bytes", "0", "--minimum-free-inodes", "0"],
+        0,
+        0,
+    );
+}
+
+fn assert_wal_reserve(extra: &[&str], minimum_bytes: u64, minimum_inodes: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    bootstrap(dir.path());
+    let server = ServerUnderTest::wal(dir.path(), extra);
+    let response = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let reserve = &body["reserve"];
+    assert_eq!(reserve["minimum_free_bytes"], minimum_bytes);
+    assert_eq!(reserve["minimum_free_inodes"], minimum_inodes);
+    assert_eq!(body["recovery"]["completed"], true);
+    let satisfied = reserve["free_bytes"].as_u64().unwrap() >= minimum_bytes
+        && reserve["free_inodes"].as_u64().unwrap() >= minimum_inodes;
+    assert_eq!(reserve["satisfied"], satisfied);
+    assert_eq!(body["status"], if satisfied { "ready" } else { "starting" });
+    assert!(
+        response.starts_with(if satisfied {
+            "HTTP/1.1 200"
+        } else {
+            "HTTP/1.1 503"
+        }),
+        "{response}"
+    );
+}
+
+#[test]
+fn wal_reserve_flags_reject_missing_or_invalid_values() {
+    for flag in ["--minimum-free-bytes", "--minimum-free-inodes"] {
+        for value in [
+            None,
+            Some("-1"),
+            Some("invalid"),
+            Some("18446744073709551616"),
+        ] {
+            let mut command = server();
+            command.arg(flag);
+            if let Some(value) = value {
+                command.arg(value);
+            }
+            let out = command.output().expect("startup");
+            assert_eq!(out.status.code(), Some(2), "{flag} {value:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains(flag));
+        }
+    }
 }
 
 #[test]

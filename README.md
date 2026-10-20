@@ -108,6 +108,14 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 | `--durability`        | `wal`     | `wal` (default) — durable group-commit `fdatasync`; an append acks only after its record is in the sharded WAL. `memory` — no WAL, no fsync; the same buffered append path with the WAL stage/wait skipped, ack on the page-cache write; **NOT locally crash-durable** — durability is delegated to (future) replication. |
 | `--wal-shards`        | CPU cores | (`wal` mode) shard / group-commit-committer count; persisted on first run, a later run must match it                                                                                                                                                                                                                      |
 | `--wal-segment-bytes` | `128 MiB` | (`wal` mode) per-shard WAL segment size; lower it only to force segment rolls in tests/benches                                                                                                                                                                                                                            |
+| `--minimum-free-bytes` | `21474836480` (20 GiB) | (`wal` mode) minimum available filesystem bytes for admin readiness. Tests may explicitly lower this, for example to `67108864` (64 MiB). |
+| `--minimum-free-inodes` | `10000` | (`wal` mode) minimum available filesystem inodes for admin readiness. Tests may explicitly lower this, for example to `1000`. |
+
+The reserve flags accept unsigned integers, including `0` to disable that
+individual threshold. `GET /_admin/ready` reports both effective minimums and
+returns 503 while either reserve is unmet, even after recovery completes.
+Production deployments should keep the default reserve; test overrides do not
+change WAL durability, store identity checks, or data-directory locking.
 
 **Read path** — performance knobs; none change protocol behaviour. Leave at defaults unless a benchmark says otherwise.
 

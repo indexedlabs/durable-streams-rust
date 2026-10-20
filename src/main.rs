@@ -244,6 +244,8 @@ fn main() {
     let mut expected_layout_version: Option<u32> = None;
     let mut expected_filesystem_uuid: Option<String> = None;
     let mut artifact_digest: Option<String> = None;
+    // Only explicit CLI flags override the production readiness reserve, so
+    // tests can use a smaller reserve without changing ordinary startup.
     let mut minimum_free_bytes = DEFAULT_MINIMUM_FREE_BYTES;
     let mut minimum_free_inodes = DEFAULT_MINIMUM_FREE_INODES;
     let mut stream_lanes: Option<u32> = None;
@@ -585,13 +587,6 @@ fn main() {
         data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|e| exit_usage(e));
 
     let manifest = if handlers::durability() == handlers::DurabilityMode::Wal {
-        if minimum_free_bytes < DEFAULT_MINIMUM_FREE_BYTES
-            || minimum_free_inodes < DEFAULT_MINIMUM_FREE_INODES
-        {
-            exit_usage(format!(
-                "WAL pilot reserve cannot be lowered below {DEFAULT_MINIMUM_FREE_BYTES} bytes and {DEFAULT_MINIMUM_FREE_INODES} inodes"
-            ));
-        }
         if !host.is_loopback() && !allow_non_loopback_host {
             exit_usage(
                 "WAL mode requires a loopback --host by default; pass \

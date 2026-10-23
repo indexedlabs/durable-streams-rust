@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
+use crate::stream_file::StreamFile;
+
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
 const CREATE_PATH_LOCK_STRIPES: usize = 256;
 
@@ -69,8 +71,10 @@ pub struct Shared {
     /// Shared handle to the live data file for lock-free positioned reads. Held
     /// here (not on `StreamState`) so compaction can swap it together with
     /// `file_base` under one `shared.write()`, giving concurrent readers a
-    /// consistent (file, file_base) pair.
-    pub file: Arc<File>,
+    /// consistent (file, file_base) pair. Opened on demand and closed by the
+    /// stream-file pool when idle (see stream_file.rs); the same handle as
+    /// `Appender.file` until a compaction swaps both.
+    pub file: Arc<StreamFile>,
     /// Writer-facing close intent: set under the appender lock the instant a
     /// close is accepted (so subsequent appends are rejected) and persisted to
     /// the sidecar. NOT what readers observe — see `closed_durable`.
@@ -96,7 +100,7 @@ pub struct Shared {
 }
 
 pub struct Appender {
-    pub file: Arc<File>,
+    pub file: Arc<StreamFile>,
     pub written: u64,
 }
 
@@ -1460,21 +1464,21 @@ impl Store {
         // then destroyed by reset_after_recovery: acked-data loss with no log
         // line. Boot must fail loudly instead; the operator fixes the resource
         // limit and the data is still intact.
-        let file = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(data_path)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "recovery: cannot open stream data file {} ({e}); refusing \
-                         to boot without it — skipping would let WAL reset destroy \
-                         its acked records",
-                        data_path.display()
-                    )
-                }),
-        );
-        let written = file
+        // Opened to prove it is there and to size it, then closed: the handle
+        // reopens on first use, so boot does not hold one descriptor per stream.
+        let opened = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(data_path)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "recovery: cannot open stream data file {} ({e}); refusing \
+                     to boot without it — skipping would let WAL reset destroy \
+                     its acked records",
+                    data_path.display()
+                )
+            });
+        let written = opened
             .metadata()
             .unwrap_or_else(|e| {
                 panic!(
@@ -1483,6 +1487,8 @@ impl Store {
                 )
             })
             .len();
+        drop(opened);
+        let file = StreamFile::lazy(data_path.to_path_buf());
         // `file_base` is the live file's logical start. With a `pending_compaction`
         // intent and the durable temp promoted above, the live file IS the full
         // residual `[new_file_base, tail)` — so `file_base = new_file_base`, derived
@@ -2276,7 +2282,8 @@ impl Store {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let fname = format!("{}~{}", encode_path(path), id);
         let file_path = lane_dir(&self.data_dir, lane_of(&fname)).join(fname);
-        let file = Arc::new(
+        let file = StreamFile::from_open(
+            file_path.clone(),
             OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -3185,9 +3192,8 @@ mod tier_tests {
     /// the appender file, bump `written` + `tail`. (Test-only shortcut around the
     /// HTTP handler.)
     async fn append_wire(st: &Arc<StreamState>, wire: &[u8]) {
-        use std::io::Write;
         let mut ap = st.appender.lock().await;
-        (&*ap.file).write_all(wire).unwrap();
+        ap.file.write_all(wire).unwrap();
         ap.written += wire.len() as u64;
         let mut s = st.shared.write().unwrap();
         let tail = s.file_base + ap.written;
@@ -4000,9 +4006,8 @@ mod tier_tests {
         // advances, but durability has NOT been published (WAL fsync pending).
         let wire = b"hello world";
         {
-            use std::io::Write;
             let mut ap = st.appender.lock().await;
-            (&*ap.file).write_all(wire).unwrap();
+            ap.file.write_all(wire).unwrap();
             ap.written += wire.len() as u64;
             let mut s = st.shared.write().unwrap();
             s.tail = s.file_base + ap.written;
@@ -4682,14 +4687,12 @@ mod expiration_reaper_tests {
 
     #[tokio::test]
     async fn hard_retirement_reports_unlinked_local_bytes() {
-        use std::io::Write;
-
         let dir = tmp_dir("reclaimed-bytes");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         let st = create(&store, "bytes", None, None);
         {
             let mut appender = st.appender.lock().await;
-            (&*appender.file).write_all(b"reclaimed").unwrap();
+            appender.file.write_all(b"reclaimed").unwrap();
             appender.written = 9;
             let mut shared = st.shared.write().unwrap();
             shared.tail = 9;

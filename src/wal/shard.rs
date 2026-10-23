@@ -1034,13 +1034,14 @@ impl Shard {
             // already in the file's cache, so the file is durable up to AT LEAST
             // this tail afterwards (a later concurrent append only extends past
             // it and lands in the next checkpoint). Conservative-safe.
-            let touched: Vec<(Arc<StreamState>, u64, Arc<std::fs::File>)> = drained
-                .iter()
-                .map(|st| {
-                    let s = st.shared.read().unwrap();
-                    (Arc::clone(st), s.tail, Arc::clone(&s.file))
-                })
-                .collect();
+            let touched: Vec<(Arc<StreamState>, u64, Arc<crate::stream_file::StreamFile>)> =
+                drained
+                    .iter()
+                    .map(|st| {
+                        let s = st.shared.read().unwrap();
+                        (Arc::clone(st), s.tail, Arc::clone(&s.file))
+                    })
+                    .collect();
             let n_touched = touched.len();
             let t_capture = t_start.elapsed();
 
@@ -1062,12 +1063,26 @@ impl Shard {
             //    records that were the only durable copy (acked-data loss).
             //    Nothing acked is at risk at abort time: acks never gate on the
             //    checkpoint, and the WAL still holds every record.
+            //    A stream's file may be closed by the stream-file pool (idle or
+            //    over budget) and is reopened here. Failing to REOPEN is not a
+            //    barrier failure — nothing was flushed or consumed, and nothing
+            //    is persisted or recycled — so it fails this checkpoint (the
+            //    drained set is re-registered by the caller) instead of aborting.
+            //    An `fdatasync` through a reopened descriptor flushes the same
+            //    inode's page cache.
             let barrier = if cfg!(target_os = "linux") && n_touched > 0 {
-                crate::store::syncfs_stream_lanes(&touched[0].2)
+                let any = touched[0].2.get()?;
+                crate::store::syncfs_stream_lanes(&any)
             } else {
-                touched
-                    .iter()
-                    .try_for_each(|(_, _, f)| crate::store::barrier_fsync(f))
+                let mut result = Ok(());
+                for (_, _, handle) in &touched {
+                    let file = handle.get()?;
+                    if let Err(e) = crate::store::barrier_fsync(&file) {
+                        result = Err(e);
+                        break;
+                    }
+                }
+                result
             };
             if let Err(e) = barrier {
                 eprintln!(
@@ -2581,7 +2596,7 @@ mod tests {
             .reserve_and_stage(RecordKind::Append, sid, 5, b"world")
             .unwrap();
         {
-            let f = Arc::clone(&st.shared.read().unwrap().file);
+            let f = st.shared.read().unwrap().file.get().unwrap();
             use std::io::Write;
             (&*f).write_all(b"helloworld").unwrap();
             // Reflect the written bytes in the logical tail so checkpoint records it.

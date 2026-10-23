@@ -480,7 +480,7 @@ impl Store {
 
         // 1) Write the residual tail to a temp file; fsync the file + its dir.
         {
-            let of = old_file.clone();
+            let of = old_file.get()?;
             let tp = tmp_path.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 use std::io::Write;
@@ -510,7 +510,11 @@ impl Store {
         }
 
         // 3) Atomic content swap, made crash-durable. In-flight readers keep the
-        //    old fd (the old inode stays readable until they drop it).
+        //    old fd (the old inode stays readable until they drop it). Pin the
+        //    old handle first: after the rename its path names the NEW inode, so
+        //    the pool must never close it and let a reader reopen the wrong file
+        //    against the old `file_base`.
+        old_file.pin()?;
         {
             let tp = tmp_path.clone();
             let lp = live_path.clone();
@@ -525,7 +529,8 @@ impl Store {
         // 4) Open the compacted file and publish (file, file_base) for readers as
         //    one consistent swap; repoint the appender's write handle. Under the
         //    appender lock, so no append observes a half-swapped state.
-        let new_file = Arc::new(
+        let new_file = crate::stream_file::StreamFile::from_open(
+            live_path.clone(),
             OpenOptions::new()
                 .read(true)
                 .append(true)
@@ -597,7 +602,7 @@ impl Store {
             let region = tokio::task::spawn_blocking(move || {
                 use std::os::unix::fs::FileExt;
                 let mut buf = vec![0u8; region_len as usize];
-                file.read_exact_at(&mut buf, file_lo).map(|_| buf)
+                file.get()?.read_exact_at(&mut buf, file_lo).map(|_| buf)
             })
             .await
             .map_err(std::io::Error::other)??;
@@ -993,11 +998,24 @@ pub fn resolve_range(st: &Arc<StreamState>, start: u64, end: u64, out: &mut Vec<
             let s = st.shared.read().unwrap();
             (s.file.clone(), s.file_base)
         };
-        out.push(ResolvedSlice::Local(Segment {
-            file,
-            file_start: live_lo - file_base,
-            len: end - live_lo,
-        }));
+        // The handle may have to reopen a file the pool closed. Compaction pins
+        // a handle before renaming over its path, so this pair stays consistent
+        // even though the open happens after the lock is released.
+        match file.get() {
+            Ok(file) => out.push(ResolvedSlice::Local(Segment {
+                file,
+                file_start: live_lo - file_base,
+                len: end - live_lo,
+            })),
+            Err(e) => {
+                // Same rule as an unreadable chunk: never drop a slice silently.
+                eprintln!(
+                    "ERROR: stream data file {} unreadable ({e}) — failing the read",
+                    file.path().display()
+                );
+                out.push(ResolvedSlice::Missing);
+            }
+        }
     }
 }
 

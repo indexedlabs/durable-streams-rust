@@ -4,6 +4,17 @@
 
 ### Minor Changes
 
+- Bound the open stream data files. The server used to keep every stream's
+  data file open for the life of the process, so its descriptor count grew with
+  the number of streams until it hit `RLIMIT_NOFILE`, after which WAL
+  checkpoints failed with `Too many open files` and cold-stream requests
+  returned 500. Files now open on demand, close after `--stream-file-idle-secs`
+  (default 60) unused, and are capped at `--max-open-stream-files` (default
+  half the `nofile` limit) by closing the least recently used. Boot recovery no
+  longer holds one descriptor per stream. A periodic `ds_fd_stats` stderr line
+  (`--fd-stats-secs`, default 60) and matching telemetry gauges report open
+  descriptors against the limit for alerting.
+
 - Bound read responses with a server-defined maximum chunk size (PROTOCOL.md §5.6).
 
   New `--max-chunk-bytes <BYTES>` (env fallback `DS_MAX_CHUNK_BYTES`), default 4 MiB —

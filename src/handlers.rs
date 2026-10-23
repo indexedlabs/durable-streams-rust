@@ -1294,9 +1294,8 @@ enum WireWriteError {
 }
 
 fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> Result<u64, WireWriteError> {
-    use std::io::Write;
     let pre_written = ap.written;
-    if (&*ap.file).write_all(wire).is_err() {
+    if ap.file.write_all(wire).is_err() {
         // A partial write (ENOSPC mid-slice) leaves garbage bytes in the file
         // PAST `ap.written` while the logical offsets don't advance — every
         // later append would land after the garbage (O_APPEND) with a logical

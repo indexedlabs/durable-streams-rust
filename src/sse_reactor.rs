@@ -391,7 +391,7 @@ impl Reactor {
                 frame_terminator(&mut sub.pending);
                 return;
             }
-            let (file, file_base, tail, closed) = {
+            let (handle, file_base, tail, closed) = {
                 let s = sub.st.shared.read().unwrap();
                 (
                     s.file.clone(),
@@ -414,9 +414,9 @@ impl Reactor {
                 // delivered as several data/control pairs (with `up_to_date`
                 // false until the last one), and `backlog(sub) > PENDING_CAP`
                 // still governs a subscriber that cannot keep up.
-                let Some((end, data)) =
+                let Some((end, data)) = handle.get().ok().and_then(|file| {
                     read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding)
-                else {
+                }) else {
                     sub.done = true;
                     frame_terminator(&mut sub.pending);
                     return;

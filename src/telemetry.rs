@@ -71,6 +71,10 @@ mod imp {
         expiry_bulk_guard_paused: Gauge<u64>,
         expiry_clock_guard_paused: Gauge<u64>,
         expiry_clock_drift: Histogram<f64>,
+        process_open_fds: Gauge<u64>,
+        process_fd_limit: Gauge<u64>,
+        stream_files_open: Gauge<u64>,
+        stream_files_max_open: Gauge<u64>,
     }
 
     impl Metrics {
@@ -186,6 +190,24 @@ mod imp {
                     .f64_histogram("ds.expiry.clock_drift")
                     .with_unit("s")
                     .with_description("Absolute wall/monotonic clock divergence.")
+                    .build(),
+                process_open_fds: meter
+                    .u64_gauge("ds.process.open_fds")
+                    .with_description("File descriptors the process holds open.")
+                    .build(),
+                process_fd_limit: meter
+                    .u64_gauge("ds.process.fd_limit")
+                    .with_description("The process's RLIMIT_NOFILE soft limit.")
+                    .build(),
+                stream_files_open: meter
+                    .u64_gauge("ds.stream_files.open")
+                    .with_description("Stream data files currently held open.")
+                    .build(),
+                stream_files_max_open: meter
+                    .u64_gauge("ds.stream_files.max_open")
+                    .with_description(
+                        "Open stream data files at which the least recently used close.",
+                    )
                     .build(),
             }
         }
@@ -428,6 +450,24 @@ mod imp {
         }
     }
 
+    pub fn record_fd_stats(
+        open_fds: Option<u64>,
+        fd_limit: Option<u64>,
+        stream_files_open: u64,
+        stream_files_max_open: u64,
+    ) {
+        if let Some(m) = metrics() {
+            if let Some(v) = open_fds {
+                m.process_open_fds.record(v, &[]);
+            }
+            if let Some(v) = fd_limit {
+                m.process_fd_limit.record(v, &[]);
+            }
+            m.stream_files_open.record(stream_files_open, &[]);
+            m.stream_files_max_open.record(stream_files_max_open, &[]);
+        }
+    }
+
     pub fn record_expiry_index_entries(entries: u64) {
         if let Some(m) = metrics() {
             m.expiry_index_entries.record(entries, &[]);
@@ -590,6 +630,14 @@ mod imp {
     #[inline(always)]
     pub fn record_offload_wait(_secs: f64) {}
     #[inline(always)]
+    pub fn record_fd_stats(
+        _open_fds: Option<u64>,
+        _fd_limit: Option<u64>,
+        _stream_files_open: u64,
+        _stream_files_max_open: u64,
+    ) {
+    }
+    #[inline(always)]
     pub fn record_expiry_index_entries(_entries: u64) {}
     #[inline(always)]
     pub fn record_expiry_scan(_checked: u64, _due: u64, _secs: f64) {}
@@ -635,9 +683,9 @@ pub use imp::{
     init, record_append, record_append_lock_wait, record_chunk_capped, record_expiry_cleanup,
     record_expiry_clock_drift, record_expiry_completed_pass, record_expiry_index_entries,
     record_expiry_oldest_due_lag, record_expiry_outcome, record_expiry_queue,
-    record_expiry_reclaimed_local_bytes, record_expiry_retry, record_expiry_scan, record_fsync,
-    record_offload_wait, record_read, record_request, record_tail_cache, set_expiry_safety_pauses,
-    Guard, Timer,
+    record_expiry_reclaimed_local_bytes, record_expiry_retry, record_expiry_scan, record_fd_stats,
+    record_fsync, record_offload_wait, record_read, record_request, record_tail_cache,
+    set_expiry_safety_pauses, Guard, Timer,
 };
 
 #[cfg(test)]

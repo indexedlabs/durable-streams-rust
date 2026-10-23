@@ -80,9 +80,34 @@ impl ServerUnderTest {
     /// Spawn a WAL server whose `RLIMIT_NOFILE` (soft and hard) is `nofile`, logging stderr
     /// to a file next to the data directory.
     fn wal_with_nofile(dir: &std::path::Path, nofile: u64) -> Self {
-        let port = unused_local_port();
         let log = dir.with_extension("stderr.log");
-        let stderr = std::fs::File::create(&log).expect("create stderr log");
+        let _ = std::fs::remove_file(&log);
+        let (child, port) = Self::spawn(dir, &log, nofile);
+        Self {
+            child,
+            dir: dir.to_path_buf(),
+            log,
+            port,
+        }
+    }
+
+    /// Stop the server and start it again over the same data directory, so boot
+    /// recovery has to bring back every stream under the same limit.
+    fn restart(&mut self, nofile: u64) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (child, port) = Self::spawn(&self.dir, &self.log, nofile);
+        self.child = child;
+        self.port = port;
+    }
+
+    fn spawn(dir: &std::path::Path, log: &std::path::Path, nofile: u64) -> (Child, u16) {
+        let port = unused_local_port();
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .expect("open stderr log");
         let mut command = server();
         command
             .args(["--durability", "wal", "--data-dir"])
@@ -120,21 +145,15 @@ impl ServerUnderTest {
                 }
                 // Lower the hard limit too: the server raises its soft limit to
                 // the hard limit at startup.
-                limit.rlim_cur = nofile as libc::rlim_t;
-                limit.rlim_max = nofile as libc::rlim_t;
+                limit.rlim_cur = nofile;
+                limit.rlim_max = nofile;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        let child = command.spawn().expect("spawn server");
-        Self {
-            child,
-            dir: dir.to_path_buf(),
-            log,
-            port,
-        }
+        (command.spawn().expect("spawn server"), port)
     }
 
     fn request(&self, request: &str) -> String {
@@ -147,7 +166,9 @@ impl ServerUnderTest {
                     let _ = stream.read_to_end(&mut response);
                     return String::from_utf8_lossy(&response).into_owned();
                 }
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
                 Err(error) => panic!("server did not listen: {error}"),
             }
         }
@@ -191,7 +212,10 @@ fn status_line(response: &str) -> &str {
 }
 
 fn body(response: &str) -> &str {
-    response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
 }
 
 #[test]
@@ -236,7 +260,11 @@ fn wal_server_serves_and_checkpoints_more_streams_than_its_fd_limit() {
     // to and read an old stream again.
     std::thread::sleep(Duration::from_secs(5));
     let appended = server.append("/fd-budget/s0", "-again");
-    assert!(appended.starts_with("HTTP/1.1 204"), "re-append: {}", status_line(&appended));
+    assert!(
+        appended.starts_with("HTTP/1.1 204"),
+        "re-append: {}",
+        status_line(&appended)
+    );
     let read = server.read("/fd-budget/s0");
     assert_eq!(body(&read), "payload-0-again");
 
@@ -245,7 +273,31 @@ fn wal_server_serves_and_checkpoints_more_streams_than_its_fd_limit() {
         "server exited:\n{}",
         tail(&server.stderr())
     );
+    // A restart recovers every stream without holding one descriptor each.
+    server.restart(NOFILE);
+    for i in (0..STREAMS).step_by(37) {
+        let path = format!("/fd-budget/s{i}");
+        let read = server.read(&path);
+        assert!(
+            read.starts_with("HTTP/1.1 200"),
+            "read {path} after restart failed: {}\nstderr tail:\n{}",
+            status_line(&read),
+            tail(&server.stderr())
+        );
+    }
+    assert!(
+        server.child.try_wait().expect("try_wait").is_none(),
+        "server exited after restart:\n{}",
+        tail(&server.stderr())
+    );
+
     let stderr = server.stderr();
+    // The descriptor gauge the deployment alarms on is reported.
+    assert!(
+        stderr.contains(r#""event":"ds_fd_stats""#),
+        "no ds_fd_stats line:\n{}",
+        tail(&stderr)
+    );
     assert!(
         !stderr.contains("Too many open files") && !stderr.contains("os error 24"),
         "server ran out of file descriptors:\n{}",

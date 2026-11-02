@@ -5742,3 +5742,111 @@ mod expiration_reaper_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod recovery_scale_tests {
+    use super::*;
+    use crate::tier::TierConfig;
+
+    /// Streams in the scale test. Prod held ~245k in one flat `streams/` dir
+    /// when the quadratic orphan scan kept boot from finishing.
+    const STREAMS: u64 = 40_000;
+    /// Linear recovery of `STREAMS` takes a few seconds; the quadratic scan
+    /// took minutes at this size.
+    const RECOVER_BOUND: Duration = Duration::from_secs(30);
+
+    fn sidecar(id: u64, path: &str) -> Meta {
+        Meta {
+            id,
+            path: path.to_string(),
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at_unix: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+            base_offset: 0,
+            closed: false,
+            closed_by: None,
+            producers: HashMap::new(),
+            last_seq_header: None,
+            last_access_unix: 0,
+            ref_count: 0,
+            soft_deleted: false,
+            segments: Vec::new(),
+            sealed_offset: 0,
+            file_base: None,
+            pending_compaction: None,
+            durable_tail: None,
+        }
+    }
+
+    #[test]
+    fn recovery_of_many_streams_is_linear_and_keeps_orphan_semantics() {
+        let dir = std::env::temp_dir().join(format!(
+            "ds-recovery-scale-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let streams_dir = lane_dir(&dir, 0);
+
+        for id in 1..=STREAMS {
+            let path = format!("scale/stream-{id}");
+            let data = streams_dir.join(format!("{}~{id}", encode_path(&path)));
+            std::fs::write(&data, b"x").unwrap();
+            std::fs::write(
+                meta_path(&data),
+                serde_json::to_vec(&sidecar(id, &path)).unwrap(),
+            )
+            .unwrap();
+        }
+        // Orphan data files (no sidecar) are deleted; a quarantined sidecar's
+        // data file is kept.
+        let orphans: Vec<PathBuf> = (0..8)
+            .map(|i| streams_dir.join(format!("orphan-{i}~{}", STREAMS + 100 + i)))
+            .collect();
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan").unwrap();
+        }
+        let parked_id = STREAMS + 1_000;
+        let parked = streams_dir.join(format!("parked~{parked_id}"));
+        std::fs::write(&parked, b"parked").unwrap();
+        std::fs::write(meta_path(&parked).with_extension("meta.corrupt"), b"torn").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let recover_dir = dir.clone();
+        // Recover on a worker so a superlinear scan fails at the bound instead
+        // of hanging the test run.
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let store = Store::new_with_tier(recover_dir, TierConfig::default());
+            let _ = tx.send((store, started.elapsed()));
+        });
+        let (store, elapsed) = rx.recv_timeout(RECOVER_BOUND).unwrap_or_else(|_| {
+            panic!("recovering {STREAMS} streams did not finish within {RECOVER_BOUND:?}")
+        });
+        let store = store.unwrap();
+        eprintln!("recovered {STREAMS} streams in {elapsed:?}");
+
+        assert_eq!(store.streams.len() as u64, STREAMS);
+        assert_eq!(store.streams.get("scale/stream-1").unwrap().tail().bytes, 1);
+        for orphan in &orphans {
+            assert!(
+                !orphan.exists(),
+                "orphan data file {} kept",
+                orphan.display()
+            );
+        }
+        assert!(parked.exists(), "quarantined data file was deleted");
+        assert_eq!(store.quarantined_stream_ids(), vec![parked_id]);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

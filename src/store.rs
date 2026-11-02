@@ -857,6 +857,45 @@ pub enum CreateResult {
     Conflict,
 }
 
+/// Periodic stderr progress for a long recovery pass. Recovery runs before the
+/// listener binds, and the default build installs no tracing subscriber, so
+/// without these lines a slow boot looks the same as a hung one.
+struct RecoveryProgress {
+    phase: &'static str,
+    total: usize,
+    started: std::time::Instant,
+    last_report: std::time::Instant,
+}
+
+impl RecoveryProgress {
+    const INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new(phase: &'static str, total: usize) -> Self {
+        let now = std::time::Instant::now();
+        RecoveryProgress {
+            phase,
+            total,
+            started: now,
+            last_report: now,
+        }
+    }
+
+    /// Report `done` of `total` at most every [`Self::INTERVAL`]. The clock is
+    /// read once per 1024 items to keep the per-stream cost negligible.
+    fn tick(&mut self, done: usize) {
+        if done % 1024 != 0 || self.last_report.elapsed() < Self::INTERVAL {
+            return;
+        }
+        self.last_report = std::time::Instant::now();
+        eprintln!(
+            "recovery: {} {done}/{} ({:.1}s)",
+            self.phase,
+            self.total,
+            self.started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 impl Store {
     pub fn has_quarantined_streams(&self) -> bool {
         self.quarantined_streams.load(Ordering::Acquire)
@@ -1175,9 +1214,12 @@ impl Store {
     /// discarded.
     fn recover(&self, streams_dir: &std::path::Path) -> std::io::Result<()> {
         let _ = streams_dir; // root; per-lane dirs derived below (lane 0 == root when lanes == 1)
+        let started = std::time::Instant::now();
         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
         let mut data_files: Vec<PathBuf> = Vec::new();
-        let mut quarantined: Vec<PathBuf> = Vec::new();
+        // Hashed, not scanned: recovery checks every data file against these,
+        // and a linear scan made boot quadratic in the stream count.
+        let mut quarantined: HashSet<PathBuf> = HashSet::new();
         let mut max_id = 0u64;
         let mut entries: Vec<PathBuf> = Vec::new();
         for lane in 0..stream_lanes() {
@@ -1185,7 +1227,15 @@ impl Store {
                 entries.push(entry?.path());
             }
         }
-        for p in entries {
+        eprintln!(
+            "recovery: found {} files in {} stream lane(s) in {:.1}s",
+            entries.len(),
+            stream_lanes(),
+            started.elapsed().as_secs_f64()
+        );
+        let mut progress = RecoveryProgress::new("reading sidecars", entries.len());
+        for (scanned, p) in entries.into_iter().enumerate() {
+            progress.tick(scanned);
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name == ".lanes" || name == ".lane" {
                 // stream-lane layout / lane-mount markers, not stream data
@@ -1219,7 +1269,7 @@ impl Store {
                 if let Some(id) = self.record_quarantined_stream(&data_path) {
                     max_id = max_id.max(id);
                 }
-                quarantined.push(data_path);
+                quarantined.insert(data_path);
             } else if name.ends_with(".meta") {
                 let data_path =
                     PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
@@ -1245,7 +1295,7 @@ impl Store {
                                 if let Some(id) = self.record_quarantined_stream(&data_path) {
                                     max_id = max_id.max(id);
                                 }
-                                quarantined.push(data_path);
+                                quarantined.insert(data_path);
                             }
                         }
                         Err(e) => {
@@ -1268,9 +1318,12 @@ impl Store {
         }
         // Drop orphan data files (no usable sidecar) — but NEVER a data file
         // whose sidecar was quarantined above.
+        let owned: HashSet<&PathBuf> = metas.values().map(|(_, dp)| dp).collect();
+        let mut orphans = 0usize;
         for p in data_files {
-            if !metas.values().any(|(_, dp)| *dp == p) && !quarantined.contains(&p) {
-                let _ = std::fs::remove_file(&p);
+            if !owned.contains(&p) && !quarantined.contains(&p) && std::fs::remove_file(&p).is_ok()
+            {
+                orphans += 1;
             }
         }
         let paths: Vec<String> = metas.keys().cloned().collect();
@@ -1278,7 +1331,9 @@ impl Store {
         // forked_from chains in corrupt sidecars (would otherwise overflow the
         // stack on boot). It self-empties between top-level calls.
         let mut visiting = HashSet::new();
-        for path in paths {
+        let mut progress = RecoveryProgress::new("recovering streams", paths.len());
+        for (recovered, path) in paths.into_iter().enumerate() {
+            progress.tick(recovered);
             self.recover_one(&path, &metas, &mut visiting);
         }
         // Refcounts are denormalized lifecycle metadata. A crash can durably
@@ -1312,6 +1367,13 @@ impl Store {
         // Keep ids unique across restarts (they feed ETags).
         let cur = self.next_id.load(Ordering::Relaxed);
         self.next_id.store(cur.max(max_id + 1), Ordering::Relaxed);
+        eprintln!(
+            "recovery: recovered {} streams ({} quarantined, {} orphan data files removed) in {:.1}s",
+            self.streams.len(),
+            quarantined.len(),
+            orphans,
+            started.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 

@@ -768,7 +768,12 @@ fn main() {
                 readiness.attach_wal(Arc::clone(&walset));
                 readiness.recovering();
             }
+            let wal_started = std::time::Instant::now();
             wal::recovery::recover(&store, &walset).expect("WAL recovery failed");
+            eprintln!(
+                "recovery: replayed the WAL in {:.1}s",
+                wal_started.elapsed().as_secs_f64()
+            );
             // Recovery can advance/torn-tail-truncate reader-visible frontiers.
             // Publish the inventory only after that authoritative reconciliation.
             store.refresh_inventory();
@@ -812,11 +817,16 @@ fn main() {
         // Subscription cursors/retries are interpreted only after stream and
         // WAL recovery establishes authoritative durable tails. Resume all
         // persisted leases and deliveries before advertising readiness.
+        let resume_started = std::time::Instant::now();
         store
             .subscriptions
             .resume(Arc::clone(&store))
             .await
             .expect("subscription recovery failed");
+        eprintln!(
+            "recovery: resumed subscriptions in {:.1}s",
+            resume_started.elapsed().as_secs_f64()
+        );
         // Start the bounded retirement coordinator in every mode so lazy expiry
         // and explicit DELETE never escape into detached cleanup work. `off`
         // disables only the proactive scanner. Recovery and subscription resume

@@ -5022,6 +5022,42 @@ mod expiration_reaper_tests {
     }
 
     #[test]
+    fn recovery_drops_only_orphan_data_files_across_many_streams() {
+        // The orphan sweep indexes kept paths once (it used to scan every
+        // sidecar per data file). Every stream with a sidecar must survive a
+        // reboot, a stray data file with no sidecar must be removed, and the
+        // sweep must stay fast with a few thousand streams.
+        let dir = tmp_dir("orphan-sweep-many-streams");
+        let n = 3_000usize;
+        let mut files = Vec::with_capacity(n);
+        {
+            let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            for i in 0..n {
+                files.push(create(&store, &format!("s{i}"), None, None).file_path.clone());
+            }
+        }
+        let streams_dir = files[0].parent().unwrap().to_path_buf();
+        let orphan = streams_dir.join("999999999");
+        std::fs::write(&orphan, b"orphan bytes").unwrap();
+
+        let started = std::time::Instant::now();
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!orphan.exists(), "orphan data file without a sidecar was kept");
+        for (i, f) in files.iter().enumerate() {
+            assert!(f.exists(), "data file for s{i} was deleted");
+            assert!(store.streams.get(&format!("s{i}")).is_some(), "s{i} not recovered");
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "recovering {n} streams took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn quarantined_filename_id_is_reserved_before_the_next_create() {
         let dir = tmp_dir("quarantined-id-reservation");
         drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());

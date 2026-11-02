@@ -1,0 +1,11 @@
+{
+  "started_at": null,
+  "orchestration_started_at": null,
+  "active_task_id": null,
+  "active_task_claimed_at": null,
+  "actor_id": "802007d0-a98e-5690-b6a5-2228dccff0cf",
+  "agent_scope_id": null,
+  "agent_id": null,
+  "spawned_agents": [],
+  "task_assignments": []
+}

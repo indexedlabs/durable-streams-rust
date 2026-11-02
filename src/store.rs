@@ -1231,7 +1231,7 @@ impl Store {
             stream_lanes(),
             started.elapsed().as_secs_f64()
         );
-        let mut progress = RecoveryProgress::new("reading sidecars", entries.len());
+        let mut progress = RecoveryProgress::new("scanning files", entries.len());
         for (scanned, p) in entries.into_iter().enumerate() {
             progress.tick(scanned);
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");

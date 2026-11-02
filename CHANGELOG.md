@@ -58,9 +58,9 @@
   the square of the stream count: a store with ~245k streams sat at 100% CPU
   for over half an hour without listening. Orphan and quarantine checks now use
   hash sets; 245k streams recover in seconds. Recovery also logs its progress
-  to stderr (`recovery: …` lines: files found, periodic `reading sidecars` and
+  to stderr (`recovery: …` lines: files found, periodic `scanning files` and
   `recovering streams` counts, a summary, WAL replay and subscription resume
-  times), so a slow boot is visible before the listener binds.
+  times), so a slow boot is visible before the server reports ready.
 
 ## 0.1.5
 

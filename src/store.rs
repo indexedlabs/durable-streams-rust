@@ -1267,9 +1267,17 @@ impl Store {
             }
         }
         // Drop orphan data files (no usable sidecar) — but NEVER a data file
-        // whose sidecar was quarantined above.
+        // whose sidecar was quarantined above. Index the kept paths once: a
+        // linear scan of `metas` per data file made boot O(streams²), which
+        // held a 245k-stream store at 100% CPU for over 30 minutes before it
+        // could listen (prod, 2026-11-02).
+        let kept: std::collections::HashSet<&PathBuf> = metas
+            .values()
+            .map(|(_, dp)| dp)
+            .chain(quarantined.iter())
+            .collect();
         for p in data_files {
-            if !metas.values().any(|(_, dp)| *dp == p) && !quarantined.contains(&p) {
+            if !kept.contains(&p) {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -5009,6 +5017,42 @@ mod expiration_reaper_tests {
         )
         .unwrap();
         assert_eq!(disk_parent.ref_count, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_drops_only_orphan_data_files_across_many_streams() {
+        // The orphan sweep indexes kept paths once (it used to scan every
+        // sidecar per data file). Every stream with a sidecar must survive a
+        // reboot, a stray data file with no sidecar must be removed, and the
+        // sweep must stay fast with a few thousand streams.
+        let dir = tmp_dir("orphan-sweep-many-streams");
+        let n = 3_000usize;
+        let mut files = Vec::with_capacity(n);
+        {
+            let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            for i in 0..n {
+                files.push(create(&store, &format!("s{i}"), None, None).file_path.clone());
+            }
+        }
+        let streams_dir = files[0].parent().unwrap().to_path_buf();
+        let orphan = streams_dir.join("999999999");
+        std::fs::write(&orphan, b"orphan bytes").unwrap();
+
+        let started = std::time::Instant::now();
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!orphan.exists(), "orphan data file without a sidecar was kept");
+        for (i, f) in files.iter().enumerate() {
+            assert!(f.exists(), "data file for s{i} was deleted");
+            assert!(store.streams.get(&format!("s{i}")).is_some(), "s{i} not recovered");
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "recovering {n} streams took {elapsed:?}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

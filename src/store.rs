@@ -1267,9 +1267,17 @@ impl Store {
             }
         }
         // Drop orphan data files (no usable sidecar) — but NEVER a data file
-        // whose sidecar was quarantined above.
+        // whose sidecar was quarantined above. Index the kept paths once: a
+        // linear scan of `metas` per data file made boot O(streams²), which
+        // held a 245k-stream store at 100% CPU for over 30 minutes before it
+        // could listen (prod, 2026-11-02).
+        let kept: std::collections::HashSet<&PathBuf> = metas
+            .values()
+            .map(|(_, dp)| dp)
+            .chain(quarantined.iter())
+            .collect();
         for p in data_files {
-            if !metas.values().any(|(_, dp)| *dp == p) && !quarantined.contains(&p) {
+            if !kept.contains(&p) {
                 let _ = std::fs::remove_file(&p);
             }
         }

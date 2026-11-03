@@ -23,7 +23,8 @@ mod imp {
 
     use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
-    use opentelemetry_otlp::{MetricExporter, SpanExporter};
+    use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+    use opentelemetry_otlp::{MetricExporter, SpanExporter, WithTonicConfig};
     use opentelemetry_sdk::metrics::{
         Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality,
     };
@@ -277,6 +278,13 @@ mod imp {
         }
     }
 
+    /// TLS for an `https://` OTEL_EXPORTER_OTLP_ENDPOINT, trusting the platform's
+    /// CA bundle. tonic's default `ClientTlsConfig` trusts no roots at all, so
+    /// without this every TLS handshake fails; an `http://` endpoint ignores it.
+    fn tls_config() -> ClientTlsConfig {
+        ClientTlsConfig::new().with_native_roots()
+    }
+
     /// Explicit-bucket view for the named instrument (boundaries in `buckets`).
     fn bucket_view(
         name: &'static str,
@@ -309,7 +317,10 @@ mod imp {
         let resource = build_resource();
 
         // ---- traces ----
-        let span_exporter = SpanExporter::builder().with_tonic().build();
+        let span_exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_tls_config(tls_config())
+            .build();
         let tracer_provider = match span_exporter {
             Ok(exporter) => Some(
                 SdkTracerProvider::builder()
@@ -327,6 +338,7 @@ mod imp {
         // ---- metrics ----
         let meter_provider = match MetricExporter::builder()
             .with_tonic()
+            .with_tls_config(tls_config())
             .with_temporality(Temporality::Cumulative)
             .build()
         {
@@ -586,6 +598,32 @@ mod imp {
         #[inline]
         pub fn elapsed_secs(&self) -> f64 {
             self.0.elapsed().as_secs_f64()
+        }
+    }
+
+    #[cfg(test)]
+    mod tls_tests {
+        use super::*;
+        use opentelemetry_otlp::WithExportConfig;
+
+        /// Logfire's endpoint form (`https://…`) builds both exporters. Without a
+        /// TLS feature the builder refuses an `https://` endpoint outright.
+        #[tokio::test]
+        async fn exporters_build_for_an_https_endpoint() {
+            let endpoint = "https://logfire-us.pydantic.dev";
+            let spans = SpanExporter::builder()
+                .with_tonic()
+                .with_tls_config(tls_config())
+                .with_endpoint(endpoint)
+                .build();
+            assert!(spans.is_ok(), "span exporter: {:?}", spans.err());
+            let metrics = MetricExporter::builder()
+                .with_tonic()
+                .with_tls_config(tls_config())
+                .with_endpoint(endpoint)
+                .with_temporality(Temporality::Cumulative)
+                .build();
+            assert!(metrics.is_ok(), "metric exporter: {:?}", metrics.err());
         }
     }
 }

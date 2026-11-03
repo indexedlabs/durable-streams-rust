@@ -16,10 +16,12 @@ WORKDIR /app
 # Copy only what the build needs (no target/, no npm/).
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# Default features only (no `tier`/`telemetry`) — minimal image, matching the
-# conformance matrix. To ship S3 tiering, add `--features tier` here AND
+# Built with `telemetry` so the production server exports its spans and metrics
+# (append and fsync latency, open files against the descriptor limit) over
+# OTLP/gRPC to the endpoint the standard `OTEL_*` variables name. A default
+# build exports no metrics. No `tier`: to ship S3 tiering, add it here AND
 # `ca-certificates` to the runtime stage.
-RUN cargo build --release --locked
+RUN cargo build --release --locked --features telemetry
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
 FROM gcr.io/distroless/cc-debian12 AS runtime

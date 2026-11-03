@@ -24,7 +24,10 @@ mod imp {
     use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
-    use opentelemetry_otlp::{MetricExporter, SpanExporter, WithTonicConfig};
+    use opentelemetry_otlp::{
+        MetricExporter, SpanExporter, WithTonicConfig, OTEL_EXPORTER_OTLP_ENDPOINT,
+        OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+    };
     use opentelemetry_sdk::metrics::{
         Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality,
     };
@@ -216,8 +219,27 @@ mod imp {
 
     static METRICS: OnceLock<Metrics> = OnceLock::new();
 
+    #[cfg(test)]
+    thread_local! {
+        static THREAD_METRICS: std::cell::Cell<Option<&'static Metrics>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     fn metrics() -> Option<&'static Metrics> {
+        #[cfg(test)]
+        if let Some(m) = THREAD_METRICS.with(|m| m.get()) {
+            return Some(m);
+        }
         METRICS.get()
+    }
+
+    /// Test-only: record this thread's measurements into `meter`'s instruments
+    /// instead of the process-wide ones, so a test reads exactly what one call
+    /// recorded while other tests record concurrently.
+    #[cfg(test)]
+    pub fn record_on_this_thread(meter: &Meter) {
+        let metrics: &'static Metrics = Box::leak(Box::new(Metrics::new(meter)));
+        THREAD_METRICS.with(|m| m.set(Some(metrics)));
     }
 
     /// Held for the lifetime of the process; its `Drop`/`shutdown` flushes the
@@ -278,11 +300,25 @@ mod imp {
         }
     }
 
-    /// TLS for an `https://` OTEL_EXPORTER_OTLP_ENDPOINT, trusting the platform's
-    /// CA bundle. tonic's default `ClientTlsConfig` trusts no roots at all, so
-    /// without this every TLS handshake fails; an `http://` endpoint ignores it.
-    fn tls_config() -> ClientTlsConfig {
-        ClientTlsConfig::new().with_native_roots()
+    /// The endpoint the tonic exporter for one signal dials, resolved exactly as
+    /// opentelemetry-otlp does: the signal's own variable, then
+    /// OTEL_EXPORTER_OTLP_ENDPOINT, then the gRPC default.
+    fn otlp_endpoint(signal_endpoint_var: &str) -> String {
+        std::env::var(signal_endpoint_var)
+            .or_else(|_| std::env::var(OTEL_EXPORTER_OTLP_ENDPOINT))
+            .unwrap_or_else(|_| "http://localhost:4317".to_string())
+    }
+
+    /// TLS for an `https://` endpoint, trusting the platform's CA bundle; none for
+    /// any other scheme. tonic's default `ClientTlsConfig` trusts no roots at all,
+    /// so without the native roots every handshake fails. The exporter builds the
+    /// TLS connector (loading those roots) whenever a config is set, whatever the
+    /// scheme, so a plaintext endpoint gets no config and needs no CA bundle.
+    fn tls_for(endpoint: &str) -> Option<ClientTlsConfig> {
+        endpoint
+            .get(.."https://".len())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            .then(|| ClientTlsConfig::new().with_native_roots())
     }
 
     /// Explicit-bucket view for the named instrument (boundaries in `buckets`).
@@ -317,10 +353,11 @@ mod imp {
         let resource = build_resource();
 
         // ---- traces ----
-        let span_exporter = SpanExporter::builder()
-            .with_tonic()
-            .with_tls_config(tls_config())
-            .build();
+        let mut span_exporter = SpanExporter::builder().with_tonic();
+        if let Some(tls) = tls_for(&otlp_endpoint(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)) {
+            span_exporter = span_exporter.with_tls_config(tls);
+        }
+        let span_exporter = span_exporter.build();
         let tracer_provider = match span_exporter {
             Ok(exporter) => Some(
                 SdkTracerProvider::builder()
@@ -336,9 +373,11 @@ mod imp {
         };
 
         // ---- metrics ----
-        let meter_provider = match MetricExporter::builder()
-            .with_tonic()
-            .with_tls_config(tls_config())
+        let mut metric_exporter = MetricExporter::builder().with_tonic();
+        if let Some(tls) = tls_for(&otlp_endpoint(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)) {
+            metric_exporter = metric_exporter.with_tls_config(tls);
+        }
+        let meter_provider = match metric_exporter
             .with_temporality(Temporality::Cumulative)
             .build()
         {
@@ -606,20 +645,51 @@ mod imp {
         use super::*;
         use opentelemetry_otlp::WithExportConfig;
 
+        #[test]
+        fn only_an_https_endpoint_gets_tls() {
+            assert!(tls_for("https://logfire-us.pydantic.dev").is_some());
+            assert!(tls_for("HTTPS://logfire-us.pydantic.dev").is_some());
+            assert!(tls_for("http://localhost:4317").is_none());
+            assert!(tls_for("http://otel-collector:4317").is_none());
+            assert!(tls_for("").is_none());
+        }
+
         /// Logfire's endpoint form (`https://…`) builds both exporters. Without a
-        /// TLS feature the builder refuses an `https://` endpoint outright.
+        /// TLS feature the builder refuses an `https://` endpoint outright. This
+        /// loads the host's CA bundle, as production does from the image.
         #[tokio::test]
         async fn exporters_build_for_an_https_endpoint() {
             let endpoint = "https://logfire-us.pydantic.dev";
+            let tls = || tls_for(endpoint).expect("https endpoint gets TLS");
             let spans = SpanExporter::builder()
                 .with_tonic()
-                .with_tls_config(tls_config())
+                .with_tls_config(tls())
                 .with_endpoint(endpoint)
                 .build();
             assert!(spans.is_ok(), "span exporter: {:?}", spans.err());
             let metrics = MetricExporter::builder()
                 .with_tonic()
-                .with_tls_config(tls_config())
+                .with_tls_config(tls())
+                .with_endpoint(endpoint)
+                .with_temporality(Temporality::Cumulative)
+                .build();
+            assert!(metrics.is_ok(), "metric exporter: {:?}", metrics.err());
+        }
+
+        /// A plaintext collector needs no CA bundle: the `http://` endpoint gets
+        /// no TLS config, so the builder never loads native roots. (With a TLS
+        /// config, a host where no roots load fails with `NativeCertsNotFound`.)
+        #[tokio::test]
+        async fn exporters_build_for_an_http_endpoint_without_a_ca_bundle() {
+            let endpoint = "http://localhost:4317";
+            assert!(tls_for(endpoint).is_none());
+            let spans = SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build();
+            assert!(spans.is_ok(), "span exporter: {:?}", spans.err());
+            let metrics = MetricExporter::builder()
+                .with_tonic()
                 .with_endpoint(endpoint)
                 .with_temporality(Temporality::Cumulative)
                 .build();
@@ -716,6 +786,8 @@ mod imp {
 // `Guard` and `record_offload_wait` are unused on some host/feature combinations
 // (offload is a Linux-only sendfile path; Guard is held but not named on macOS),
 // but are part of the stable public surface — keep the re-export complete.
+#[cfg(all(test, feature = "telemetry"))]
+pub use imp::record_on_this_thread;
 #[allow(unused_imports)]
 pub use imp::{
     init, record_append, record_append_lock_wait, record_chunk_capped, record_expiry_cleanup,

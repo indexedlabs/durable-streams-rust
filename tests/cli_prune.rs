@@ -431,6 +431,24 @@ fn prune_deletes_nothing_when_a_kept_stream_is_forked_from_a_removed_one() {
 }
 
 #[test]
+fn prune_creates_nothing_in_a_directory_without_a_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    two_tenant_store(dir.path());
+    std::fs::remove_file(dir.path().join(".durable-streams.lock")).unwrap();
+    let before = tree(dir.path());
+    for dry_run in [true, false] {
+        let out = prune(dir.path(), "mighty", dry_run);
+        assert_eq!(out.status.code(), Some(1), "dry run {dry_run}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(".durable-streams.lock does not exist"),
+            "{stderr}"
+        );
+        assert_eq!(tree(dir.path()), before, "dry run {dry_run}");
+    }
+}
+
+#[test]
 fn prune_usage_errors_exit_2() {
     for args in [
         vec!["prune"],

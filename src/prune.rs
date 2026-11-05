@@ -11,7 +11,7 @@
 //! deleted.
 //!
 //! A removed stream loses its data file, its compaction temp file, its local
-//! sealed chunks and its sidecar. Recovery already treats a stream whose files
+//! sealed chunks (named by its manifest or not) and its sidecar. Recovery already treats a stream whose files
 //! are gone as deleted: the sidecar pass finds nothing, WAL replay skips records
 //! for unknown stream ids, and fork refcounts are rebuilt from the surviving
 //! graph. Lane markers (`.lanes`, `.lane`) are never touched.
@@ -92,10 +92,10 @@ struct Stream {
     path: String,
     forked_from: Option<String>,
     pattern: Option<usize>,
-    /// Data file, compaction temp file and local sealed chunks that exist.
-    files: Vec<PathBuf>,
-    /// Bytes of the sidecar and every file in `files`.
-    bytes: u64,
+    sidecar_bytes: u64,
+    /// Data file, compaction temp file and local sealed chunks that exist,
+    /// each with its size.
+    files: Vec<(PathBuf, u64)>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -121,7 +121,7 @@ struct Plan {
     /// Indexes into `streams` of the streams to remove.
     remove: Vec<usize>,
     /// Files shared by a kept and a removed stream (colliding compaction temp
-    /// names); never removed.
+    /// names); never removed, and counted as kept.
     shared_files: HashSet<PathBuf>,
     subscriptions: Option<SubscriptionPlan>,
     per_pattern: [Counts; 4],
@@ -180,11 +180,20 @@ pub fn run(args: &[String]) -> ! {
         ));
     }
     // Held until exit: no server can open the store while it is being pruned.
-    let _lock = crate::data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|error| {
-        exit_refused(format!(
-            "{error}; prune runs only on a stopped store, so stop the server that holds it"
-        ))
-    });
+    // The lock file must already exist, so neither a dry run nor a prune
+    // creates a file in the store.
+    let _lock = crate::data_dir_lock::DataDirLock::acquire_existing(&data_dir).unwrap_or_else(
+        |error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                exit_refused(format!(
+                    "{error}; prune runs only on a stopped server's data directory, lock file included"
+                ))
+            }
+            exit_refused(format!(
+                "{error}; prune runs only on a stopped store, so stop the server that holds it"
+            ))
+        },
+    );
 
     let plan = plan(&data_dir, keep).unwrap_or_else(|error| exit_refused(error));
     let mut stdout = io::stdout().lock();
@@ -288,9 +297,36 @@ enum SidecarRead {
     Unparsable(PathBuf),
 }
 
+/// Every file in `segments/`, under each data-file name it could belong to.
+/// Chunks are named `<data file>.seg.<start>` and staged as
+/// `<data file>.seg.tmp`; a data-file name can itself contain `.seg.`, so a
+/// chunk is indexed under every prefix ending before a `.seg.`.
+fn segment_index(segments_dir: &Path) -> io::Result<HashMap<String, Vec<PathBuf>>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let entries = match std::fs::read_dir(segments_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(index),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        for (at, _) in name.match_indices(".seg.") {
+            index
+                .entry(name[..at].to_string())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    Ok(index)
+}
+
 fn read_sidecar(
     sidecar: &Path,
     segments_dir: &Path,
+    segments: &HashMap<String, Vec<PathBuf>>,
     compact_temps: &HashSet<PathBuf>,
 ) -> io::Result<SidecarRead> {
     let bytes = std::fs::read(sidecar).map_err(|error| {
@@ -306,38 +342,41 @@ fn read_sidecar(
         .file_name()
         .and_then(|n| n.to_str())
         .expect("listed as UTF-8");
-    let data = sidecar.with_file_name(name.strip_suffix(".meta").expect("listed as .meta"));
-    let mut files = Vec::new();
-    let mut total = bytes.len() as u64;
-    if let Some(len) = file_len(&data)? {
-        total += len;
-        files.push(data.clone());
-    }
+    let data_name = name.strip_suffix(".meta").expect("listed as .meta");
+    let data = sidecar.with_file_name(data_name);
+    let mut candidates = vec![data.clone()];
     // Named exactly as the server names it (`with_extension`, so a path with a
     // dot in its last segment shares the stem's temp name).
     let compact = data.with_extension("compact.tmp");
     if compact_temps.contains(&compact) {
-        if let Some(len) = file_len(&compact)? {
-            total += len;
-            files.push(compact);
-        }
+        candidates.push(compact);
     }
+    // Chunks the manifest names, and any the manifest missed: one staged
+    // before a crash cut a seal short, its `.seg.tmp`, or a local copy left
+    // after the manifest flipped to Remote. The server's hard delete sweeps
+    // the same `<data file>.seg.` prefix.
     for segment in &meta.segments {
         if let Some(local) = &segment.local_file {
-            let chunk = segments_dir.join(local);
-            if let Some(len) = file_len(&chunk)? {
-                total += len;
-                files.push(chunk);
+            candidates.push(segments_dir.join(local));
+        }
+    }
+    candidates.extend(segments.get(data_name).into_iter().flatten().cloned());
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for candidate in candidates {
+        if seen.insert(candidate.clone()) {
+            if let Some(len) = file_len(&candidate)? {
+                files.push((candidate, len));
             }
         }
     }
     Ok(SidecarRead::Stream(Stream {
         sidecar: sidecar.to_path_buf(),
+        sidecar_bytes: bytes.len() as u64,
         pattern: classify(&meta.path, false),
         path: meta.path,
         forked_from: meta.forked_from,
         files,
-        bytes: total,
     }))
 }
 
@@ -380,9 +419,10 @@ fn plan(data_dir: &Path, keep: Tenant) -> io::Result<Plan> {
     }
 
     let segments_dir = data_dir.join("segments");
+    let segments = segment_index(&segments_dir)?;
     let mut streams = Vec::with_capacity(sidecars.len());
     for read in parallel_map(&sidecars, |sidecar| {
-        read_sidecar(sidecar, &segments_dir, &compact_temps)
+        read_sidecar(sidecar, &segments_dir, &segments, &compact_temps)
     }) {
         match read? {
             SidecarRead::Stream(stream) => streams.push(stream),
@@ -396,7 +436,7 @@ fn plan(data_dir: &Path, keep: Tenant) -> io::Result<Plan> {
     // Data files no sidecar names are orphans that recovery drops at boot.
     let claimed: HashSet<&Path> = streams
         .iter()
-        .flat_map(|stream| stream.files.iter().map(PathBuf::as_path))
+        .flat_map(|stream| stream.files.iter().map(|(file, _)| file.as_path()))
         .collect();
     let orphans: Vec<&PathBuf> = data_files
         .iter()
@@ -425,9 +465,8 @@ fn plan(data_dir: &Path, keep: Tenant) -> io::Result<Plan> {
             continue;
         };
         per_pattern[pattern].streams += 1;
-        per_pattern[pattern].bytes += stream.bytes;
         if PATTERNS[pattern].0 == keep {
-            kept_files.extend(stream.files.iter().cloned());
+            kept_files.extend(stream.files.iter().map(|(file, _)| file.clone()));
             if let Some(parent) = &stream.forked_from {
                 if let Some(Some(tenant)) = tenant_by_path.get(parent.as_str()) {
                     if *tenant != keep {
@@ -444,10 +483,25 @@ fn plan(data_dir: &Path, keep: Tenant) -> io::Result<Plan> {
     }
     let shared_files = remove
         .iter()
-        .flat_map(|&i| streams[i].files.iter())
+        .flat_map(|&i| streams[i].files.iter().map(|(file, _)| file))
         .filter(|file| kept_files.contains(*file))
         .cloned()
         .collect();
+    // Bytes: each file once, and a file a kept stream also names counts as
+    // kept, because the prune leaves it on disk.
+    let mut counted = HashSet::new();
+    for stream in &streams {
+        let Some(pattern) = stream.pattern else {
+            continue;
+        };
+        let kept = PATTERNS[pattern].0 == keep;
+        per_pattern[pattern].bytes += stream.sidecar_bytes;
+        for (file, len) in &stream.files {
+            if (kept || !kept_files.contains(file)) && counted.insert(file) {
+                per_pattern[pattern].bytes += len;
+            }
+        }
+    }
 
     let subscriptions = plan_subscriptions(data_dir, keep, &mut per_pattern, &mut problems)?;
     Ok(Plan {
@@ -622,7 +676,7 @@ fn execute(plan: &Plan) -> io::Result<()> {
     // stream by its recorded path when it is run again.
     for result in parallel_map(&plan.remove, |&index| {
         let stream = &plan.streams[index];
-        for file in &stream.files {
+        for (file, _) in &stream.files {
             if !plan.shared_files.contains(file) {
                 remove_if_present(file)?;
             }
@@ -826,18 +880,82 @@ mod tests {
         // Both `a.x~1` and `a.y~2` name their compaction temp `a.compact.tmp`.
         std::fs::write(streams.join("a.compact.tmp"), b"residual").unwrap();
         std::fs::write(streams.join("d~3.compact.tmp"), b"residual").unwrap();
+        let sidecar = |name: &str| std::fs::metadata(streams.join(name)).unwrap().len();
         let plan = plan(dir.path(), Tenant::Mighty).unwrap();
         assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+        // The shared temp stays on disk, so it counts as kept, once.
+        assert_eq!(plan.per_pattern[2].bytes, sidecar("a.x~1.meta") + 5 + 8);
+        assert_eq!(plan.per_pattern[0].bytes, sidecar("a.y~2.meta") + 5);
+        assert_eq!(plan.per_pattern[1].bytes, sidecar("d~3.meta") + 5 + 8);
         execute(&plan).unwrap();
-        let mut left: Vec<String> = std::fs::read_dir(&streams)
+        assert_eq!(
+            names(&streams),
+            [".lane", ".lanes", "a.compact.tmp", "a.x~1", "a.x~1.meta"]
+        );
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        left.sort();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn removes_manifested_and_unmanifested_chunks_of_removed_streams_only() {
+        let dir = store(&[
+            ("a", "/mighty-next/v1/prod/a", None),
+            ("c", "/circuits/v1/prod/c", None),
+        ]);
+        let streams = dir.path().join("streams");
+        let segments = dir.path().join("segments");
+        std::fs::create_dir_all(&segments).unwrap();
+        // `c~2`'s manifest names its first chunk; a crash left a second chunk
+        // and a staging file the manifest never recorded.
+        let meta_file = streams.join("c~2.meta");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_file).unwrap()).unwrap();
+        meta["segments"] = serde_json::json!([{
+            "logical_start": 0, "len": 4, "remote_key": null,
+            "local_file": "c~2.seg.0000000000000000",
+        }]);
+        meta["sealed_offset"] = serde_json::json!(4);
+        std::fs::write(&meta_file, serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(segments.join("c~2.seg.0000000000000000"), b"0123").unwrap();
+        std::fs::write(segments.join("c~2.seg.0000000000000004"), b"4567").unwrap();
+        std::fs::write(segments.join("c~2.seg.tmp"), b"89a").unwrap();
+        // The kept stream's unmanifested chunk, and one no sidecar names.
+        std::fs::write(segments.join("a~1.seg.0000000000000000"), b"0123").unwrap();
+        std::fs::write(segments.join("zz~9.seg.0000000000000000"), b"0123").unwrap();
+        let sidecar = |name: &str| std::fs::metadata(streams.join(name)).unwrap().len();
+
+        let plan = plan(dir.path(), Tenant::Mighty).unwrap();
+        assert!(plan.problems.is_empty(), "{:?}", plan.problems);
         assert_eq!(
-            left,
-            [".lane", ".lanes", "a.compact.tmp", "a.x~1", "a.x~1.meta"]
+            plan.per_pattern[0].bytes,
+            sidecar("c~2.meta") + 5 + 4 + 4 + 3
         );
+        assert_eq!(plan.per_pattern[2].bytes, sidecar("a~1.meta") + 5 + 4);
+        execute(&plan).unwrap();
+        assert_eq!(
+            names(&segments),
+            ["a~1.seg.0000000000000000", "zz~9.seg.0000000000000000"]
+        );
+        assert_eq!(names(&streams), [".lane", ".lanes", "a~1", "a~1.meta"]);
+    }
+
+    #[test]
+    fn indexes_chunks_under_every_seg_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.seg.y~4.seg.0000000000000000"), b"").unwrap();
+        let index = segment_index(dir.path()).unwrap();
+        assert!(index.contains_key("x"));
+        assert!(index.contains_key("x.seg.y~4"));
+        assert!(segment_index(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

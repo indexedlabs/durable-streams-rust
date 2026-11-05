@@ -6,6 +6,7 @@ mod engine_raw;
 mod expiry_reaper;
 mod handlers;
 mod http1;
+mod prune;
 mod reserved_paths;
 mod srvstats;
 #[cfg(target_os = "linux")]
@@ -205,6 +206,9 @@ fn main() {
         .is_some_and(|argument| argument == "bootstrap-store")
     {
         bootstrap_store(&raw_args[1..]);
+    }
+    if raw_args.first().is_some_and(|argument| argument == "prune") {
+        prune::run(&raw_args[1..]);
     }
     let mut port: u16 = 4437; // protocol default (PROTOCOL.md §13.1)
     let mut host: std::net::IpAddr = [127, 0, 0, 1].into();

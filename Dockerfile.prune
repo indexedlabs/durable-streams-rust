@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+#
+# The offline prune image: the same `durable-streams-server` binary as the
+# server image, run as `prune` against a STOPPED store's data directory. Built
+# and published by .github/workflows/docker.yml to
+# ghcr.io/<repo>-prune, separately from the server image, so pinning it never
+# rolls a running server.
+#
+#   docker run --rm --network none -v /var/lib/durable-streams:/data \
+#     ghcr.io/indexedlabs/durable-streams-rust-prune@sha256:… \
+#     --data-dir /data --tenant mighty --dry-run
+#
+# It runs as root so it can unlink files owned by the server's user; the
+# subscription state it rewrites keeps the original owner.
+
+FROM rust:1.96.0-bookworm AS build
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# Default features: prune exports no telemetry.
+RUN cargo build --release --locked --bin durable-streams-server
+
+FROM gcr.io/distroless/cc-debian12 AS runtime
+COPY --from=build /app/target/release/durable-streams-server /usr/local/bin/durable-streams-server
+ENTRYPOINT ["/usr/local/bin/durable-streams-server", "prune"]

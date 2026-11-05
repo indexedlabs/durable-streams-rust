@@ -86,6 +86,33 @@ rules, encoded/dot-segment aliases, missing certificate identities, and unavaila
 fail closed. Build the sidecar image with `Dockerfile.access`; release CI publishes it as the
 `-access` sibling of the storage image.
 
+## Offline prune by tenant
+
+`durable-streams-server prune` removes one tenant's streams and subscriptions from a **stopped**
+store's data directory, so a copy of the volume made by snapshot serves only the other tenant.
+`--tenant` names the tenant to keep:
+
+```bash
+durable-streams-server prune --data-dir /data --tenant mighty --dry-run   # report only
+durable-streams-server prune --data-dir /data --tenant mighty             # delete
+```
+
+| Tenant | Path patterns (whole segments) |
+| --- | --- |
+| `indexed` | `/circuits/v1/prod/…`, `/agent-runs/v1/prod/…` |
+| `mighty` | `/mighty-next/v1/prod/…`, `/circuits/v1/source-<40 hex>/…` |
+
+Streams are chosen by the `path` recorded in each `.meta` sidecar, subscriptions by their stream
+root. The command plans every removal before making any and prints streams, bytes and subscriptions
+kept and removed per pattern. It exits 1 having deleted nothing when the data directory's lock is
+held, a sidecar is quarantined (`.meta.corrupt`) or unparsable, a stream or subscription matches
+neither tenant, or a kept stream is forked from a removed one. A removed stream loses its data file,
+compaction temp file, local sealed chunks and sidecar; lane markers are never touched. The next boot
+recovers the store as if those streams had been deleted. Sidecars are read and files unlinked on 64
+threads, because a volume restored from a snapshot loads its blocks lazily. `Dockerfile.prune`
+builds an image whose entrypoint is `durable-streams-server prune`; CI publishes it as the `-prune`
+sibling of the storage image.
+
 ## Flags
 
 `durable-streams-server [flags]` — every flag is optional. The defaults give a

@@ -51,6 +51,14 @@
   readiness response is now served `Cache-Control: no-store` so that re-read cannot be
   answered from a stored copy.
 
+### Patch Changes
+
+- Record the WAL fsync telemetry. `ds.append.fsync.duration` and
+  `ds.append.fsync.batch_size` were registered under the `telemetry` feature
+  but never recorded, so both histograms stayed empty. The group-commit
+  committer now records each successful commit's `fdatasync` time and its
+  batch size in records.
+
 ## 0.1.5
 
 ### Patch Changes

@@ -1606,10 +1606,12 @@ impl Shard {
             return Ok(None);
         }
         let (seg, sealed) = self.collect_fsync_targets();
+        let fsync_t0 = crate::telemetry::Timer::start();
         for s in &sealed {
             s.fdatasync()?;
         }
         seg.fdatasync()?;
+        crate::telemetry::record_fsync(fsync_t0.elapsed_secs(), watermark - durable);
         // Snapshotted-before-fsync watermark, published exactly.
         self.publish_durable(watermark);
         Ok(Some(watermark))

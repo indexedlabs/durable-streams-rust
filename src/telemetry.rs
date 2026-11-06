@@ -87,7 +87,7 @@ mod imp {
                 append_fsync_duration: meter
                     .f64_histogram("ds.append.fsync.duration")
                     .with_unit("s")
-                    .with_description("Leader barrier-fsync duration for coalesced appends.")
+                    .with_description("Group-commit fdatasync duration for coalesced appends.")
                     .build(),
                 append_fsync_batch_size: meter
                     .u64_histogram("ds.append.fsync.batch_size")

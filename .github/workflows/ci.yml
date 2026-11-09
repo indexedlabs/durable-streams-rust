@@ -24,7 +24,9 @@ concurrency:
 jobs:
   cargo:
     name: cargo build + test + clippy
-    runs-on: [self-hosted, mighty-ci-4x8]
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","mighty-ci-8x32"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +58,9 @@ jobs:
   conformance:
     name: conformance (${{ matrix.config.name }})
     needs: cargo
-    runs-on: [self-hosted, mighty-ci-2x8]
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","mighty-ci-2x8"]') }}
     timeout-minutes: 20
     strategy:
       fail-fast: false

@@ -5085,6 +5085,9 @@ mod expiration_reaper_tests {
         // sidecar per data file). Every stream with a sidecar must survive a
         // reboot, a stray data file with no sidecar must be removed, and the
         // sweep must stay fast with a few thousand streams.
+        // The stream-lane count is process-global; the WAL lane tests change it
+        // under this guard, and a lane flip mid-test would misplace files.
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
         let dir = tmp_dir("orphan-sweep-many-streams");
         let n = 3_000usize;
         let mut files = Vec::with_capacity(n);
@@ -5897,6 +5900,9 @@ mod recovery_scale_tests {
 
     #[test]
     fn recovery_of_many_streams_is_linear_and_keeps_orphan_semantics() {
+        // The stream-lane count is process-global; the WAL lane tests change it
+        // under this guard, and a lane flip mid-test would misplace files.
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
         // A TempDir is removed on unwind too, so a failed run leaves no ~80k files.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();

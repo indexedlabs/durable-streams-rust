@@ -1606,10 +1606,15 @@ impl Shard {
             return Ok(None);
         }
         let (seg, sealed) = self.collect_fsync_targets();
+        // `ds.append.fsync.duration` / `ds.append.fsync.batch_size` (telemetry
+        // feature): the barrier covering this group commit. A zero-sized no-op
+        // in a default build.
+        let fsync_t0 = crate::telemetry::Timer::start();
         for s in &sealed {
             s.fdatasync()?;
         }
         seg.fdatasync()?;
+        crate::telemetry::record_fsync(fsync_t0.elapsed_secs(), watermark - durable);
         // Snapshotted-before-fsync watermark, published exactly.
         self.publish_durable(watermark);
         Ok(Some(watermark))
@@ -2678,6 +2683,94 @@ mod tests {
         );
 
         h.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dashboard's fsync panel reads `ds.append.fsync.duration`; the batch
+    /// size beside it must be the records that one barrier made durable.
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn commit_records_one_fsync_sample_per_group_commit() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+        use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        /// Keeps (metric name, data-point count, data-point sum) per histogram point.
+        #[derive(Clone, Default)]
+        struct Histograms(Arc<Mutex<Vec<(String, u64, f64)>>>);
+
+        impl PushMetricExporter for Histograms {
+            async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+                let mut points = self.0.lock().unwrap();
+                for metric in metrics.scope_metrics().flat_map(|scope| scope.metrics()) {
+                    let name = metric.name().to_string();
+                    match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(h)) => points
+                            .extend(h.data_points().map(|p| (name.clone(), p.count(), p.sum()))),
+                        AggregatedMetrics::U64(MetricData::Histogram(h)) => points.extend(
+                            h.data_points()
+                                .map(|p| (name.clone(), p.count(), p.sum() as f64)),
+                        ),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+            fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+                Ok(())
+            }
+            fn temporality(&self) -> Temporality {
+                Temporality::Cumulative
+            }
+        }
+
+        const K: u64 = 5;
+        let exported = Histograms::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(
+                PeriodicReader::builder(exported.clone())
+                    .with_interval(Duration::from_secs(3600))
+                    .build(),
+            )
+            .build();
+        crate::telemetry::record_on_this_thread(&provider.meter("fsync-test"));
+
+        let dir = tmp("fsync-metric");
+        let sh = Shard::open(dir.clone()).unwrap();
+        for i in 0..K {
+            sh.reserve_and_stage(RecordKind::Append, 7, i * 4, b"data")
+                .unwrap();
+        }
+        // One group commit on this thread: one barrier covers all K records.
+        assert_eq!(sh.commit_once().unwrap(), Some(K));
+        assert_eq!(sh.commit_once().unwrap(), None, "nothing left to commit");
+        provider.force_flush().unwrap();
+
+        let points = exported.0.lock().unwrap().clone();
+        let of = |name: &str| -> Vec<(u64, f64)> {
+            points
+                .iter()
+                .filter(|(n, _, _)| n == name)
+                .map(|(_, count, sum)| (*count, *sum))
+                .collect()
+        };
+        assert_eq!(
+            of("ds.append.fsync.batch_size"),
+            vec![(1, K as f64)],
+            "exactly one batch-size sample, equal to the records committed"
+        );
+        let durations = of("ds.append.fsync.duration");
+        assert_eq!(durations.len(), 1, "one duration series");
+        assert_eq!(durations[0].0, 1, "exactly one fsync duration sample");
+        assert!(durations[0].1 >= 0.0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

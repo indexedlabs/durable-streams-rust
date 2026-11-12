@@ -5091,7 +5091,11 @@ mod expiration_reaper_tests {
         {
             let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
             for i in 0..n {
-                files.push(create(&store, &format!("s{i}"), None, None).file_path.clone());
+                files.push(
+                    create(&store, &format!("s{i}"), None, None)
+                        .file_path
+                        .clone(),
+                );
             }
         }
         let streams_dir = files[0].parent().unwrap().to_path_buf();
@@ -5102,10 +5106,16 @@ mod expiration_reaper_tests {
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let elapsed = started.elapsed();
 
-        assert!(!orphan.exists(), "orphan data file without a sidecar was kept");
+        assert!(
+            !orphan.exists(),
+            "orphan data file without a sidecar was kept"
+        );
         for (i, f) in files.iter().enumerate() {
             assert!(f.exists(), "data file for s{i} was deleted");
-            assert!(store.streams.get(&format!("s{i}")).is_some(), "s{i} not recovered");
+            assert!(
+                store.streams.get(&format!("s{i}")).is_some(),
+                "s{i} not recovered"
+            );
         }
         assert!(
             elapsed < std::time::Duration::from_secs(30),
@@ -5887,14 +5897,9 @@ mod recovery_scale_tests {
 
     #[test]
     fn recovery_of_many_streams_is_linear_and_keeps_orphan_semantics() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds-recovery-scale-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // A TempDir is removed on unwind too, so a failed run leaves no ~80k files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         let streams_dir = lane_dir(&dir, 0);
 
@@ -5947,8 +5952,5 @@ mod recovery_scale_tests {
         }
         assert!(parked.exists(), "quarantined data file was deleted");
         assert_eq!(store.quarantined_stream_ids(), vec![parked_id]);
-
-        drop(store);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

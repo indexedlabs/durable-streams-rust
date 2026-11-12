@@ -4,6 +4,12 @@
 
 ### Minor Changes
 
+- Add an offline `prune` subcommand that removes one tenant's streams and
+  subscriptions from a stopped store, chosen by each sidecar's recorded path,
+  and a `-prune` image that runs it. It plans every removal first and deletes
+  nothing when any stream matches neither tenant or a kept stream is forked
+  from a removed one.
+
 - Bound the open stream data files. The server used to keep every stream's
   data file open for the life of the process, so its descriptor count grew with
   the number of streams until it hit `RLIMIT_NOFILE`, after which WAL

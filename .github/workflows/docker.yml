@@ -1,6 +1,9 @@
-# Build the storage and mTLS access-sidecar images and publish them to GitHub Container Registry.
+# Build the storage, mTLS access-sidecar and offline prune images and publish them to GitHub
+# Container Registry.
 #
-#   ghcr.io/pgxsinkit/durable-streams-rust
+#   ghcr.io/<github.repository>           (today ghcr.io/indexedlabs/durable-streams-rust)
+#   ghcr.io/<github.repository>-access
+#   ghcr.io/<github.repository>-prune
 #
 # Pushes to main publish `main` + `sha-…` tags; version tags (v*) publish semver
 # tags; pull requests build without pushing. Same shape as the docker workflow in
@@ -43,6 +46,9 @@ jobs:
           - name: access
             dockerfile: Dockerfile.access
             suffix: '-access'
+          - name: prune
+            dockerfile: Dockerfile.prune
+            suffix: '-prune'
     steps:
       - uses: actions/checkout@v4
 

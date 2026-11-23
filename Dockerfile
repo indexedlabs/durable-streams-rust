@@ -18,12 +18,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Built with `telemetry` so the production server exports its spans and metrics
 # (append and fsync latency, open files against the descriptor limit) over
-# OTLP/gRPC to the endpoint the standard `OTEL_*` variables name. A default
-# build exports no metrics. No `tier`: to ship S3 tiering, add it here AND
-# `ca-certificates` to the runtime stage.
+# OTLP/gRPC to the endpoint the standard `OTEL_*` variables name. An `https://`
+# endpoint such as Logfire (`https://logfire-us.pydantic.dev`) is reached over
+# TLS, trusting the runtime stage's CA bundle (/etc/ssl/certs, which the
+# distroless base ships). A default build exports no metrics. No `tier`: to ship
+# S3 tiering, add it here.
 RUN cargo build --release --locked --features telemetry
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
+# Its /etc/ssl/certs/ca-certificates.crt holds the roots the OTLP exporter trusts.
 FROM gcr.io/distroless/cc-debian12 AS runtime
 COPY --from=build /app/target/release/durable-streams-server /usr/local/bin/durable-streams-server
 # Protocol default port (PROTOCOL.md §13.1); override with `--port`.

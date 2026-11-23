@@ -59,7 +59,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # zero-dependency, zero-overhead telemetry path unless explicitly enabled.
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true }
-opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
+# `tls` (rustls with ring) + `tls-roots` (the platform's CA bundle) let the gRPC
+# exporter reach an `https://` collector such as Logfire; an `http://` endpoint
+# stays plaintext and loads no roots.
+opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic", "tls", "tls-roots"] }
 opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
 
@@ -73,8 +76,9 @@ object_store = { version = "0.11", optional = true, features = ["aws"] }
 
 [features]
 default = []
-# Enable OTLP span + metric export over gRPC (tonic). Endpoint/protocol/timeout
-# and sampling are configured entirely via the standard OTEL_* env vars.
+# Enable OTLP span + metric export over gRPC (tonic), with TLS for `https://`
+# endpoints. Endpoint/headers/timeout and sampling are configured entirely via
+# the standard OTEL_* env vars.
 telemetry = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",

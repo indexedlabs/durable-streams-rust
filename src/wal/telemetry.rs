@@ -289,6 +289,8 @@ impl StatsSnapshot {
     /// Mean nanoseconds an append waited to acquire the shard `inner` Mutex.
     /// `0` when no acquisition was timed. The headline per-shard write-
     /// serialization signal — near-zero when uncontended, climbs under load.
+    // Read only by the stats tests; neither emitter prints it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn avg_inner_wait_ns(&self) -> f64 {
         if self.inner_lock_acquires == 0 {
             0.0
@@ -298,6 +300,8 @@ impl StatsSnapshot {
     }
 
     /// Mean nanoseconds an append waited to acquire the per-append `dirty` Mutex.
+    // Read only by the stats tests; neither emitter prints it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn avg_dirty_wait_ns(&self) -> f64 {
         if self.dirty_lock_acquires == 0 {
             0.0
@@ -308,6 +312,8 @@ impl StatsSnapshot {
 
     /// Mean durability waiters woken per commit (`waiters_woken / fsync_count`).
     /// The thundering-herd fan-out: how many parked appenders each commit wakes.
+    // Read only by the stats tests; neither emitter prints it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn avg_waiters_woken(&self) -> f64 {
         if self.fsync_count == 0 {
             0.0

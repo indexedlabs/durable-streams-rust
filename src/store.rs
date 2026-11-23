@@ -857,6 +857,45 @@ pub enum CreateResult {
     Conflict,
 }
 
+/// Periodic stderr progress for a long recovery pass. Recovery runs before the
+/// listener binds, and the default build installs no tracing subscriber, so
+/// without these lines a slow boot looks the same as a hung one.
+struct RecoveryProgress {
+    phase: &'static str,
+    total: usize,
+    started: std::time::Instant,
+    last_report: std::time::Instant,
+}
+
+impl RecoveryProgress {
+    const INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new(phase: &'static str, total: usize) -> Self {
+        let now = std::time::Instant::now();
+        RecoveryProgress {
+            phase,
+            total,
+            started: now,
+            last_report: now,
+        }
+    }
+
+    /// Report `done` of `total` at most every [`Self::INTERVAL`]. The clock is
+    /// read once per 1024 items to keep the per-stream cost negligible.
+    fn tick(&mut self, done: usize) {
+        if done % 1024 != 0 || self.last_report.elapsed() < Self::INTERVAL {
+            return;
+        }
+        self.last_report = std::time::Instant::now();
+        eprintln!(
+            "recovery: {} {done}/{} ({:.1}s)",
+            self.phase,
+            self.total,
+            self.started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 impl Store {
     pub fn has_quarantined_streams(&self) -> bool {
         self.quarantined_streams.load(Ordering::Acquire)
@@ -1175,6 +1214,7 @@ impl Store {
     /// discarded.
     fn recover(&self, streams_dir: &std::path::Path) -> std::io::Result<()> {
         let _ = streams_dir; // root; per-lane dirs derived below (lane 0 == root when lanes == 1)
+        let started = std::time::Instant::now();
         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
         let mut data_files: Vec<PathBuf> = Vec::new();
         let mut quarantined: Vec<PathBuf> = Vec::new();
@@ -1185,7 +1225,15 @@ impl Store {
                 entries.push(entry?.path());
             }
         }
-        for p in entries {
+        eprintln!(
+            "recovery: found {} files in {} stream lane(s) in {:.1}s",
+            entries.len(),
+            stream_lanes(),
+            started.elapsed().as_secs_f64()
+        );
+        let mut progress = RecoveryProgress::new("scanning files", entries.len());
+        for (scanned, p) in entries.into_iter().enumerate() {
+            progress.tick(scanned);
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name == ".lanes" || name == ".lane" {
                 // stream-lane layout / lane-mount markers, not stream data
@@ -1276,9 +1324,10 @@ impl Store {
             .map(|(_, dp)| dp)
             .chain(quarantined.iter())
             .collect();
+        let mut orphans = 0usize;
         for p in data_files {
-            if !kept.contains(&p) {
-                let _ = std::fs::remove_file(&p);
+            if !kept.contains(&p) && std::fs::remove_file(&p).is_ok() {
+                orphans += 1;
             }
         }
         let paths: Vec<String> = metas.keys().cloned().collect();
@@ -1286,7 +1335,9 @@ impl Store {
         // forked_from chains in corrupt sidecars (would otherwise overflow the
         // stack on boot). It self-empties between top-level calls.
         let mut visiting = HashSet::new();
-        for path in paths {
+        let mut progress = RecoveryProgress::new("recovering streams", paths.len());
+        for (recovered, path) in paths.into_iter().enumerate() {
+            progress.tick(recovered);
             self.recover_one(&path, &metas, &mut visiting);
         }
         // Refcounts are denormalized lifecycle metadata. A crash can durably
@@ -1320,6 +1371,13 @@ impl Store {
         // Keep ids unique across restarts (they feed ETags).
         let cur = self.next_id.load(Ordering::Relaxed);
         self.next_id.store(cur.max(max_id + 1), Ordering::Relaxed);
+        eprintln!(
+            "recovery: recovered {} streams ({} quarantined, {} orphan data files removed) in {:.1}s",
+            self.streams.len(),
+            quarantined.len(),
+            orphans,
+            started.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -5027,13 +5085,20 @@ mod expiration_reaper_tests {
         // sidecar per data file). Every stream with a sidecar must survive a
         // reboot, a stray data file with no sidecar must be removed, and the
         // sweep must stay fast with a few thousand streams.
+        // The stream-lane count is process-global; the WAL lane tests change it
+        // under this guard, and a lane flip mid-test would misplace files.
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
         let dir = tmp_dir("orphan-sweep-many-streams");
         let n = 3_000usize;
         let mut files = Vec::with_capacity(n);
         {
             let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
             for i in 0..n {
-                files.push(create(&store, &format!("s{i}"), None, None).file_path.clone());
+                files.push(
+                    create(&store, &format!("s{i}"), None, None)
+                        .file_path
+                        .clone(),
+                );
             }
         }
         let streams_dir = files[0].parent().unwrap().to_path_buf();
@@ -5044,10 +5109,16 @@ mod expiration_reaper_tests {
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let elapsed = started.elapsed();
 
-        assert!(!orphan.exists(), "orphan data file without a sidecar was kept");
+        assert!(
+            !orphan.exists(),
+            "orphan data file without a sidecar was kept"
+        );
         for (i, f) in files.iter().enumerate() {
             assert!(f.exists(), "data file for s{i} was deleted");
-            assert!(store.streams.get(&format!("s{i}")).is_some(), "s{i} not recovered");
+            assert!(
+                store.streams.get(&format!("s{i}")).is_some(),
+                "s{i} not recovered"
+            );
         }
         assert!(
             elapsed < std::time::Duration::from_secs(30),
@@ -5784,5 +5855,108 @@ mod expiration_reaper_tests {
         worker.join().unwrap();
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod recovery_scale_tests {
+    use super::*;
+    use crate::tier::TierConfig;
+
+    /// Streams in the scale test. Prod held ~245k in one flat `streams/` dir
+    /// when the quadratic orphan scan kept boot from finishing.
+    const STREAMS: u64 = 40_000;
+    /// Linear recovery of `STREAMS` takes a few seconds; the quadratic scan
+    /// took minutes at this size.
+    const RECOVER_BOUND: Duration = Duration::from_secs(30);
+
+    fn sidecar(id: u64, path: &str) -> Meta {
+        Meta {
+            id,
+            path: path.to_string(),
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at_unix: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+            base_offset: 0,
+            closed: false,
+            closed_by: None,
+            producers: HashMap::new(),
+            last_seq_header: None,
+            last_access_unix: 0,
+            ref_count: 0,
+            soft_deleted: false,
+            segments: Vec::new(),
+            sealed_offset: 0,
+            file_base: None,
+            pending_compaction: None,
+            durable_tail: None,
+        }
+    }
+
+    #[test]
+    fn recovery_of_many_streams_is_linear_and_keeps_orphan_semantics() {
+        // The stream-lane count is process-global; the WAL lane tests change it
+        // under this guard, and a lane flip mid-test would misplace files.
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
+        // A TempDir is removed on unwind too, so a failed run leaves no ~80k files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let streams_dir = lane_dir(&dir, 0);
+
+        for id in 1..=STREAMS {
+            let path = format!("scale/stream-{id}");
+            let data = streams_dir.join(format!("{}~{id}", encode_path(&path)));
+            std::fs::write(&data, b"x").unwrap();
+            std::fs::write(
+                meta_path(&data),
+                serde_json::to_vec(&sidecar(id, &path)).unwrap(),
+            )
+            .unwrap();
+        }
+        // Orphan data files (no sidecar) are deleted; a quarantined sidecar's
+        // data file is kept.
+        let orphans: Vec<PathBuf> = (0..8)
+            .map(|i| streams_dir.join(format!("orphan-{i}~{}", STREAMS + 100 + i)))
+            .collect();
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan").unwrap();
+        }
+        let parked_id = STREAMS + 1_000;
+        let parked = streams_dir.join(format!("parked~{parked_id}"));
+        std::fs::write(&parked, b"parked").unwrap();
+        std::fs::write(meta_path(&parked).with_extension("meta.corrupt"), b"torn").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let recover_dir = dir.clone();
+        // Recover on a worker so a superlinear scan fails at the bound instead
+        // of hanging the test run.
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let store = Store::new_with_tier(recover_dir, TierConfig::default());
+            let _ = tx.send((store, started.elapsed()));
+        });
+        let (store, elapsed) = rx.recv_timeout(RECOVER_BOUND).unwrap_or_else(|_| {
+            panic!("recovering {STREAMS} streams did not finish within {RECOVER_BOUND:?}")
+        });
+        let store = store.unwrap();
+        eprintln!("recovered {STREAMS} streams in {elapsed:?}");
+
+        assert_eq!(store.streams.len() as u64, STREAMS);
+        assert_eq!(store.streams.get("scale/stream-1").unwrap().tail().bytes, 1);
+        for orphan in &orphans {
+            assert!(
+                !orphan.exists(),
+                "orphan data file {} kept",
+                orphan.display()
+            );
+        }
+        assert!(parked.exists(), "quarantined data file was deleted");
+        assert_eq!(store.quarantined_stream_ids(), vec![parked_id]);
     }
 }

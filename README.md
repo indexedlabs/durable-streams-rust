@@ -86,6 +86,34 @@ rules, encoded/dot-segment aliases, missing certificate identities, and unavaila
 fail closed. Build the sidecar image with `Dockerfile.access`; release CI publishes it as the
 `-access` sibling of the storage image.
 
+## Offline prune by tenant
+
+`durable-streams-server prune` removes one tenant's streams and subscriptions from a **stopped**
+store's data directory, so a copy of the volume made by snapshot serves only the other tenant.
+`--tenant` names the tenant to keep:
+
+```bash
+durable-streams-server prune --data-dir /data --tenant mighty --dry-run   # report only
+durable-streams-server prune --data-dir /data --tenant mighty             # delete
+```
+
+| Tenant | Path patterns (whole segments) |
+| --- | --- |
+| `indexed` | `/circuits/v1/prod/…`, `/agent-runs/v1/prod/…` |
+| `mighty` | `/mighty-next/v1/prod/…`, `/circuits/v1/source-<40 hex>/…` |
+
+Streams are chosen by the `path` recorded in each `.meta` sidecar, subscriptions by their stream
+root. The command plans every removal before making any and prints streams, bytes and subscriptions
+kept and removed per pattern, and changes no file on a dry run. It exits 1 having deleted nothing
+when the data directory's lock file is missing or held, a sidecar is quarantined (`.meta.corrupt`)
+or unparsable, a stream or subscription matches neither tenant, or a kept stream is forked from a
+removed one. A removed stream loses its data file, compaction temp file, local sealed chunks
+(including any its manifest missed) and sidecar; lane markers are never touched. The next boot
+recovers the store as if those streams had been deleted. Sidecars are read and files unlinked on 64
+threads, because a volume restored from a snapshot loads its blocks lazily. `Dockerfile.prune`
+builds an image whose entrypoint is `durable-streams-server prune`; CI publishes it as the `-prune`
+sibling of the storage image.
+
 ## Flags
 
 `durable-streams-server [flags]` — every flag is optional. The defaults give a
@@ -273,7 +301,7 @@ The `s3` backend works with any S3-compatible endpoint — Cloudflare R2, Fly/Ti
 
 ## Observability (OpenTelemetry)
 
-Opt-in via the **`telemetry` Cargo feature** (off by default — a default build pulls no OpenTelemetry dependencies and adds zero hot-path overhead): `cargo build --release --features telemetry`. Configured entirely by the standard `OTEL_*` env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, …); spans + metrics export over OTLP/gRPC. The release image (`Dockerfile`, published to `ghcr.io/indexedlabs/durable-streams-rust`) is built with this feature.
+Opt-in via the **`telemetry` Cargo feature** (off by default — a default build pulls no OpenTelemetry dependencies and adds zero hot-path overhead): `cargo build --release --features telemetry`. Configured entirely by the standard `OTEL_*` env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, …); spans + metrics export over OTLP/gRPC. An `https://` endpoint is reached over TLS (rustls), trusting the platform's CA bundle (`/etc/ssl/certs`, or `SSL_CERT_FILE`); an `http://` endpoint stays plaintext and needs no CA bundle. For Logfire, set `OTEL_EXPORTER_OTLP_ENDPOINT=https://logfire-us.pydantic.dev` and `OTEL_EXPORTER_OTLP_HEADERS=Authorization=<write token>`; `OTEL_TRACES_SAMPLER=always_off` exports metrics only. The release image (`Dockerfile`, published to `ghcr.io/indexedlabs/durable-streams-rust`) is built with this feature.
 
 The instrumentation is deliberately lean and aimed at finding bottlenecks: a single `ds.request` span (bounded attributes only — never the stream path/id) plus metrics. The two most useful are **`ds.append.fsync.batch_size`** (group-commit health — how many appends fold into one fsync) and **`ds.read.offload.wait`** (blocking-pool queue wait, the cold-read pressure signal); alongside append fsync/lock-wait/total duration, read duration by mode, tail-cache hit ratio, and a request counter. All labels are bounded (engine, live, cache, outcome, …).
 

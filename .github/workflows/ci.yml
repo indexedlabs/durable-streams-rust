@@ -53,6 +53,25 @@ jobs:
             target/release/durable-streams-access
           retention-days: 1
 
+  # The release image builds with `telemetry` (see the Dockerfile), and the default
+  # build above never compiles that code.
+  telemetry:
+    name: cargo test + clippy (telemetry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Test
+        run: cargo test --release --locked --features telemetry
+
+      - name: Clippy
+        run: cargo clippy --release --locked --all-targets --features telemetry -- -D warnings
+
   conformance:
     name: conformance (${{ matrix.config.name }})
     needs: cargo

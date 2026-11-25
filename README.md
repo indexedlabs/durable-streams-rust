@@ -225,7 +225,8 @@ Every run configuration — durability (`wal` vs `memory`), resident tail cache
 on/off, read-offload, response chunk size — is **protocol-equivalent**, and CI
 runs the full conformance suite once per configuration (the `conformance` matrix in
 `.github/workflows/ci.yml`; flags are passed via `RUST_SERVER_ARGS`, e.g.
-`RUST_SERVER_ARGS="--durability memory" bun run test:conformance`).
+`RUST_SERVER_ARGS="--durability memory" bun run test:conformance`). The `tier` job
+runs it once more with `--tier s3` against a local S3.
 
 ## What it implements
 
@@ -297,7 +298,7 @@ In `memory` mode there is no WAL and no WAL replay. Recovery is a sidecar pass: 
 
 Opt-in (`--tier`, off by default). Because streams are append-only and immutable by position, the server can break a stream into fixed-size, CDN-friendly **segments** (`--tier-segment-bytes`, default 8 MiB): once data leaves the hot tail it is **sealed** and offloaded to object storage, and catch-up reads of cold history are served from there. Recent data stays local (the hot tier, served zero-copy as today). With `--tier off` the server is byte-identical to a single-file deployment.
 
-The `s3` backend works with any S3-compatible endpoint — Cloudflare R2, Fly/Tigris, MinIO, Backblaze B2 — behind the **`tier` Cargo feature** (a default build pulls no object-storage dependencies): `cargo build --release --features tier`. Flags are in the [table above](#flags); credentials come from the environment only. Durability is unchanged — an append still acks only after the local fsync; offload is strictly post-durability. The seal/upload/manifest lifecycle, crash-safe live-file compaction, and CDN/GC behaviour are documented in [ARCHITECTURE.md › Tiering](ARCHITECTURE.md#tiering-hot-buffer--cold-storage-optional). Conformance passes with tiering on as well as off (a manual check — the CI matrix runs the default, tier-less build).
+The `s3` backend works with any S3-compatible endpoint — Cloudflare R2, Fly/Tigris, MinIO, Backblaze B2 — behind the **`tier` Cargo feature** (a default build pulls no object-storage dependencies): `cargo build --release --features tier`. Flags are in the [table above](#flags); credentials come from the environment only: `DS_S3_ACCESS_KEY_ID`/`DS_S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), and with no keys the host's role (an EKS web identity, the ECS task role, else the EC2 instance profile). The release image is built with this feature. Durability is unchanged — an append still acks only after the local fsync; offload is strictly post-durability. The seal/upload/manifest lifecycle, crash-safe live-file compaction, and CDN/GC behaviour are documented in [ARCHITECTURE.md › Tiering](ARCHITECTURE.md#tiering-hot-buffer--cold-storage-optional). Conformance passes with tiering on as well as off: CI's `tier` job builds with the feature, runs its tests and the S3 adapter's against a local S3 (moto's server), and runs the conformance suite with `--tier s3` on that bucket and 4 KiB segments, so the suite's streams are offloaded and read back.
 
 ## Observability (OpenTelemetry)
 

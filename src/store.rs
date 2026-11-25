@@ -3230,6 +3230,7 @@ pub fn compute_cursor(client_cursor: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tier_tests {
     use super::*;
+    use crate::blobstore::BlobStore as _;
     use crate::tier::{TierConfig, TierKind};
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -4013,7 +4014,6 @@ mod tier_tests {
 
     #[tokio::test]
     async fn clean_upload_carries_its_sha256_and_succeeds() {
-        use crate::blobstore::BlobStore as _;
         let dir = tmp_dir("clean-upload");
         let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
         let blob = Arc::new(RecordingBlobStore {

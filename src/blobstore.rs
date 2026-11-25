@@ -36,7 +36,7 @@ pub fn sha256_of(body: &[u8]) -> Sha256Digest {
 /// have the object store do it (and by the S3 adapter as a guard on the bytes it
 /// is about to hand to the transport).
 fn check_digest(key: &str, body: &[u8], expected: &Sha256Digest) -> io::Result<()> {
-    if &sha256_of(body) != expected {
+    if sha256_of(body) != *expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("blobstore: SHA-256 mismatch for {key}; upload refused"),

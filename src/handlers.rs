@@ -5854,7 +5854,9 @@ mod tier_live_reader_tests {
         let got = match resp.body {
             // The resident tail chunk, or the live file served zero-copy.
             Body::Full(b) => b.to_vec(),
-            Body::FileRange { segments, .. } => crate::store::materialize_segments(&segments),
+            Body::FileRange { segments, .. } => {
+                crate::store::materialize_segments(&segments).to_vec()
+            }
             _ => panic!("a tail long-poll must not take the cold streaming path"),
         };
         assert_eq!(got, b"NEXT-APPEND");

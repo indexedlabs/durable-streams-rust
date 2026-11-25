@@ -3970,6 +3970,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/corrupt", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -4092,6 +4093,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/clean", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,

@@ -3839,6 +3839,127 @@ mod tier_tests {
         }
     }
 
+    /// A BlobStore that flips one bit of each body after the caller has taken
+    /// its digest — a piece corrupted in flight — then hands it to the local
+    /// store. It also snapshots the stream's sidecar at upload time, so a test
+    /// can tell whether a refused upload touched it.
+    struct CorruptingBlobStore {
+        inner: crate::blobstore::LocalFsBlobStore,
+        sidecar: std::sync::Mutex<Option<PathBuf>>,
+        sidecar_at_upload: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+    impl crate::blobstore::BlobStore for CorruptingBlobStore {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: bytes::Bytes,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            let path = self.sidecar.lock().unwrap().clone().unwrap();
+            *self.sidecar_at_upload.lock().unwrap() = std::fs::read(path).ok();
+            let mut bad = body.to_vec();
+            bad[0] ^= 0x01;
+            self.inner.put(key, bytes::Bytes::from(bad))
+        }
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            start: u64,
+            len: u64,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+            self.inner.get_range(key, start, len)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
+            self.inner.head(key)
+        }
+        fn delete<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_upload_is_refused_and_local_bytes_kept() {
+        // A piece corrupted in flight is refused by the object store: the segment
+        // stays Local, the sidecar is not rewritten, and the local bytes remain
+        // (chunk file and live data file) and readable.
+        let dir = tmp_dir("corrupt-upload");
+        let cold = dir.join("cold");
+        let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
+        let blob = Arc::new(CorruptingBlobStore {
+            inner: crate::blobstore::LocalFsBlobStore::new(cold.clone()).unwrap(),
+            sidecar: std::sync::Mutex::new(None),
+            sidecar_at_upload: std::sync::Mutex::new(None),
+        });
+        store.blobstore = Some(blob.clone());
+        let store = Arc::new(store);
+        let cfg = StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        };
+        let st = match store.create("s/corrupt", cfg, None, 0).unwrap() {
+            CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let sidecar = meta_path(&st.file_path);
+        *blob.sidecar.lock().unwrap() = Some(sidecar.clone());
+
+        let total = 100 * 1024usize;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        let live_before = std::fs::read(&st.file_path).unwrap();
+
+        store.maybe_seal(&st).await;
+
+        // The upload was attempted, and the sidecar is as it was when S3 was asked.
+        let at_upload = blob.sidecar_at_upload.lock().unwrap().clone();
+        assert!(at_upload.is_some(), "an upload must have been attempted");
+        assert_eq!(
+            std::fs::read(&sidecar).ok(),
+            at_upload,
+            "a refused upload must not rewrite the sidecar"
+        );
+        // No object landed, and no segment is Remote.
+        let objects: Vec<_> = std::fs::read_dir(&cold).unwrap().collect();
+        assert!(objects.is_empty(), "refused piece must leave no object");
+        let (n_local, n_remote, chunk_paths) = {
+            let m = st.tier.manifest.lock().unwrap();
+            let paths: Vec<PathBuf> = m
+                .segments
+                .iter()
+                .filter_map(|s| match &s.placement {
+                    crate::tier::Placement::Local(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect();
+            (
+                m.segments.iter().filter(|s| !s.remote).count(),
+                m.segments.iter().filter(|s| s.remote).count(),
+                paths,
+            )
+        };
+        assert_eq!((n_local, n_remote), (1, 0), "segment must stay Local");
+        // The local bytes are kept: the staged chunk file and the live data file.
+        assert!(chunk_paths.iter().all(|p| p.exists()), "chunk file kept");
+        assert_eq!(std::fs::read(&st.file_path).unwrap(), live_before);
+        let got = read_logical(&st, 0, total as u64).await;
+        assert_eq!(got, payload, "bytes stay readable from the SSD");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn sealed_local_offload_failure_is_readable() {
         // Offload-failure resilience: a sealed segment whose upload fails stays

@@ -533,6 +533,7 @@ mod tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 

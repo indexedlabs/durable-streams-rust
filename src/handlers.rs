@@ -18,6 +18,7 @@ const H_CLOSED: &str = "stream-closed";
 const H_CURSOR: &str = "stream-cursor";
 const H_TTL: &str = "stream-ttl";
 const H_EXPIRES_AT: &str = "stream-expires-at";
+const H_TIER_AFTER_IDLE: &str = "stream-tier-after-idle";
 const H_SEQ: &str = "stream-seq";
 const H_PRODUCER_ID: &str = "producer-id";
 const H_PRODUCER_EPOCH: &str = "producer-epoch";
@@ -458,7 +459,7 @@ fn cors_preflight() -> Resp {
         )
         .hs(
             "access-control-allow-headers",
-            "content-type, authorization, If-None-Match, Stream-Seq, Stream-TTL, Stream-Expires-At, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
+            "content-type, authorization, If-None-Match, Stream-Seq, Stream-TTL, Stream-Expires-At, Stream-Tier-After-Idle, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
         )
         .body(empty())
 }
@@ -606,6 +607,15 @@ fn parse_ttl(v: &str) -> Result<u64, ()> {
         return Err(());
     }
     v.parse().map_err(|_| ())
+}
+
+/// `Stream-Tier-After-Idle` on create: seconds, as `Stream-TTL` spells them, or
+/// `never`.
+fn parse_tier_after_idle(v: &str) -> Result<TierAfterIdle, ()> {
+    if v == "never" {
+        return Ok(TierAfterIdle::Never);
+    }
+    parse_ttl(v).map(TierAfterIdle::Secs)
 }
 
 /// Minimal RFC 3339 parser (YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)).
@@ -823,6 +833,13 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         },
         None => None,
     };
+    let tier_after_idle = match header_str(&req, H_TIER_AFTER_IDLE) {
+        Some(v) => match parse_tier_after_idle(v) {
+            Ok(idle) => Some(idle),
+            Err(_) => return text_response(400, "invalid Stream-Tier-After-Idle"),
+        },
+        None => None,
+    };
     let create_closed = header_is_true(&req, H_CLOSED);
     let host = header_str(&req, "host").map(|s| s.to_string());
 
@@ -949,6 +966,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         forked_from,
         fork_offset_raw,
         fork_sub_offset: sub_offset,
+        tier_after_idle,
     };
 
     let is_json = is_json_content_type(&content_type);
@@ -3063,6 +3081,9 @@ async fn handle_head(store: Arc<Store>, path: String) -> Resp {
     if let Some(raw) = &st.config.expires_at_raw {
         b = b.h(H_EXPIRES_AT, raw.clone());
     }
+    if let Some(idle) = st.config.tier_after_idle {
+        b = b.h(H_TIER_AFTER_IDLE, idle.to_string());
+    }
     if t.closed {
         b = b.hs(H_CLOSED, "true");
     }
@@ -3120,6 +3141,7 @@ mod admin_inventory_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 
@@ -3363,6 +3385,7 @@ mod bug1_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 
@@ -4108,6 +4131,7 @@ mod memory_mode_tests {
             forked_from: Some("status/parent".into()),
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         assert!(matches!(
             store
@@ -4484,6 +4508,169 @@ mod memory_mode_tests {
         drop(source_appender);
         drop(child);
         drop(source);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn idle_put(path: &str, idle: Option<&str>) -> Req {
+        let mut put = put_req(path, "application/octet-stream");
+        if let Some(idle) = idle {
+            put.headers
+                .push(("stream-tier-after-idle".into(), idle.into()));
+        }
+        put
+    }
+
+    /// `HEAD` status and its `Stream-Tier-After-Idle` value, if any.
+    async fn head_idle(store: &Arc<Store>, path: &str) -> (u16, Option<String>) {
+        let resp = handle(
+            Arc::clone(store),
+            Req {
+                method: Method::Head,
+                path: path.into(),
+                query: None,
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let idle = resp
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "stream-tier-after-idle")
+            .map(|(_, value)| value.clone());
+        (resp.status, idle)
+    }
+
+    #[tokio::test]
+    async fn tier_after_idle_round_trips_through_head_and_restart() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("tier-after-idle");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for (path, idle) in [
+            ("idle/secs", Some("600")),
+            ("idle/never", Some("never")),
+            ("idle/default", None),
+        ] {
+            assert_eq!(
+                handle(Arc::clone(&store), idle_put(path, idle))
+                    .await
+                    .status,
+                201
+            );
+        }
+        let expected = [
+            ("idle/secs", Some("600".to_string())),
+            ("idle/never", Some("never".to_string())),
+            ("idle/default", None),
+        ];
+        for (path, idle) in &expected {
+            assert_eq!(head_idle(&store, path).await, (200, idle.clone()), "{path}");
+        }
+
+        // A store without `--tier s3` keeps the value across a restart: it is
+        // in the sidecar, not only in memory.
+        drop(store);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for (path, idle) in &expected {
+            assert_eq!(
+                head_idle(&store, path).await,
+                (200, idle.clone()),
+                "{path} after restart"
+            );
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn create_meeting_an_existing_stream_keeps_its_tier_after_idle() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("tier-after-idle-existing");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/own", Some("60")))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/none", None))
+                .await
+                .status,
+            201
+        );
+
+        // Another value, `never`, or no header at all is still a matching
+        // create, and the stored value stays as it is.
+        for idle in [Some("600"), Some("never"), None] {
+            assert_eq!(
+                handle(Arc::clone(&store), idle_put("idle/own", idle))
+                    .await
+                    .status,
+                200,
+                "{idle:?}"
+            );
+            assert_eq!(
+                head_idle(&store, "idle/own").await,
+                (200, Some("60".into()))
+            );
+        }
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/none", Some("60")))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(head_idle(&store, "idle/none").await, (200, None));
+
+        // ...and the ignored values never reached the sidecar either.
+        drop(store);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            head_idle(&store, "idle/own").await,
+            (200, Some("60".into()))
+        );
+        assert_eq!(head_idle(&store, "idle/none").await, (200, None));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bad_tier_after_idle_answers_400_and_creates_nothing() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("tier-after-idle-bad");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for bad in [
+            "",
+            "-1",
+            "01",
+            "1.5",
+            " 60",
+            "Never",
+            "default",
+            "18446744073709551616",
+        ] {
+            let resp = handle(Arc::clone(&store), idle_put("idle/bad", Some(bad))).await;
+            assert_eq!(resp.status, 400, "{bad:?}");
+            assert_eq!(head_idle(&store, "idle/bad").await, (404, None), "{bad:?}");
+        }
+        // A bad value is refused even where the stream already exists.
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/bad", None))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/bad", Some("soon")))
+                .await
+                .status,
+            400
+        );
+
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

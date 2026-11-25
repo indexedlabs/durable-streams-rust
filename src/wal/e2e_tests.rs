@@ -867,6 +867,7 @@ async fn strict_created_dir_reopens_wal_only_without_data_loss() {
                         forked_from: None,
                         fork_offset_raw: None,
                         fork_sub_offset: None,
+                        tier_after_idle: None,
                     },
                     None,
                     0,

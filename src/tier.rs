@@ -251,6 +251,9 @@ pub struct TierConfig {
     /// Directory for the local BlobStore (kind == Local) and for staged sealed
     /// chunk files before offload (all kinds). Defaults to `<data_dir>/cold`.
     pub local_dir: Option<PathBuf>,
+    /// `--tier-after-idle-secs`: the idle time of a stream with none of its own
+    /// (`Stream-Tier-After-Idle`). `None` = only streams with their own move.
+    pub after_idle_secs: Option<u64>,
 }
 
 impl Default for TierConfig {
@@ -268,6 +271,7 @@ impl Default for TierConfig {
             access_key_id: None,
             secret_access_key: None,
             local_dir: None,
+            after_idle_secs: None,
         }
     }
 }

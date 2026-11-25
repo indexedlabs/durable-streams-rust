@@ -557,9 +557,6 @@ fn main() {
     if tier.after_idle_secs.is_some() && tier.kind != tier::TierKind::S3 {
         exit_usage("--tier-after-idle-secs requires --tier s3");
     }
-    if expiry_reaper.mode == ExpiryReaperMode::Delete && tier.kind == tier::TierKind::S3 {
-        exit_usage("--expiry-reaper-mode delete cannot be combined with --tier s3");
-    }
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
     // append path with the WAL stage/wait skipped (no splice intercept, no forced
@@ -711,6 +708,9 @@ fn main() {
         let store = Arc::new(
             Store::new_with_tier(data_dir.clone(), tier.clone()).expect("failed to init store"),
         );
+        // Recovery removed the local state of every stream whose tier delete a
+        // crash interrupted; delete their remote objects before serving.
+        store.finish_pending_tier_deletes().await;
         if handlers::durability() == handlers::DurabilityMode::Memory {
             store.refresh_inventory();
         }

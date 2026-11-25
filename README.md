@@ -188,7 +188,7 @@ Recovery parks an unreadable stream sidecar as `.meta.corrupt` and never deletes
 
 S3 credentials come from the **environment**, never flags: `DS_S3_ACCESS_KEY_ID` /
 `DS_S3_SECRET_ACCESS_KEY` (or the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
-Proactive `--expiry-reaper-mode delete` is refused with S3 tiering until remote deletion has a durable GC tombstone; `off`, `observe`, lazy expiry, and explicit deletion remain available.
+Deleting a stream with pieces in the remote tier, by request or by expiry, first writes a durable note of its pending object deletes (`<data file>.tier-delete`, beside the sidecar), then removes the stream and its objects and clears the note. A note stays when an object delete fails or an upload is still running. Before serving, startup finishes the notes a crash or failure left; it stops at the first object delete that fails, keeps that note and the ones after it for the next start, and serves (a note it cannot read is skipped and kept). A fenced stream seals and uploads nothing more. So `--expiry-reaper-mode delete` runs with S3 tiering. Nothing but the store should delete from the bucket: a bucket rule that expired objects would leave sidecars listing objects no longer there.
 
 ### Choosing a configuration
 

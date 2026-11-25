@@ -420,12 +420,15 @@ fn expiry_reaper_cli_rejects_invalid_mode_and_unbounded_controls() {
     }
 }
 
+/// Every S3 delete is recorded before it is made, so the deleting reaper and
+/// the S3 tier start together. A build without the `tier` feature stops later,
+/// at the store's S3 client, never at a guard on the pair.
 #[test]
-fn proactive_expiry_reaping_rejects_s3_tiering() {
+fn proactive_expiry_reaping_starts_with_s3_tiering() {
     let dir = std::env::temp_dir().join("ds-rust-expiry-tier-guard");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
-    let mut args = wal_args(&dir, "14983");
+    let mut args = wal_args(&dir, &unused_local_port().to_string());
     args.extend(
         [
             "--expiry-reaper-mode",
@@ -440,15 +443,193 @@ fn proactive_expiry_reaping_rejects_s3_tiering() {
         .into_iter()
         .map(str::to_string),
     );
-    let out = server().args(args).output().expect("tier guard");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("--expiry-reaper-mode delete cannot be combined with --tier s3"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    #[cfg(feature = "tier")]
+    {
+        let child = server()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert_eq!(
+            exit_code_within(child, std::time::Duration::from_secs(5)),
+            None,
+            "--expiry-reaper-mode delete with --tier s3 must start"
+        );
+    }
+    #[cfg(not(feature = "tier"))]
+    {
+        let out = server().args(args).output().expect("tier startup");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("cannot be combined with --tier s3"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("--tier s3 requires building with `--features tier`"),
+            "stderr: {stderr}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The deleting reaper with the S3 tier against a local S3: an expired stream
+/// with bytes in the bucket is gone from the SSD and from the bucket. Ignored by
+/// default; CI's `tier` job runs it against moto's server. To run it by hand,
+/// start a local S3 on 127.0.0.1:9000 with an existing bucket, then:
+///
+///   DS_S3_BUCKET=ds-tier-test DS_S3_ACCESS_KEY_ID=… DS_S3_SECRET_ACCESS_KEY=… \
+///   cargo test --features tier --test cli_durability_guards \
+///     delete_mode_removes_an_expired_tiered_stream -- --ignored
+#[cfg(feature = "tier")]
+#[test]
+#[ignore]
+fn delete_mode_removes_an_expired_tiered_stream_from_the_ssd_and_the_bucket() {
+    use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
+
+    let endpoint = "http://127.0.0.1:9000".to_string();
+    let bucket = std::env::var("DS_S3_BUCKET").unwrap_or_else(|_| "ds-tier-test".into());
+    let mut builder = AmazonS3Builder::new()
+        .with_endpoint(endpoint.clone())
+        .with_region("us-east-1")
+        .with_bucket_name(bucket.clone())
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false);
+    if let (Ok(key), Ok(secret)) = (
+        std::env::var("DS_S3_ACCESS_KEY_ID"),
+        std::env::var("DS_S3_SECRET_ACCESS_KEY"),
+    ) {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let s3 = builder.build().expect("test S3 client");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let exists = |key: &str| {
+        rt.block_on(async {
+            match s3.head(&ObjPath::from(key)).await {
+                Ok(_) => true,
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(error) => panic!("head {key}: {error}"),
+            }
+        })
+    };
+
+    let dir = std::env::temp_dir().join(format!("ds-rust-expiry-tier-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let prefix = format!(
+        "ds-e2e-{}-{}/",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let extra: Vec<String> = [
+        "--tier",
+        "s3",
+        "--tier-endpoint",
+        endpoint.as_str(),
+        "--tier-region",
+        "us-east-1",
+        "--tier-bucket",
+        bucket.as_str(),
+        "--tier-key-prefix",
+        prefix.as_str(),
+        "--tier-path-style",
+        "--tier-allow-http",
+        "--tier-segment-bytes",
+        "4096",
+        "--tier-compact-bytes",
+        "0",
+        "--expiry-reaper-mode",
+        "delete",
+        "--expiry-startup-grace-seconds",
+        "0",
+        "--expiry-scan-rate",
+        "1000",
+        "--expiry-delete-rate",
+        "1000",
+        "--expiry-delete-concurrency",
+        "1",
+        "--expiry-bulk-fraction",
+        "1.0",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let server = ServerUnderTest::wal(&dir, &extra);
+
+    let created = server.request(
+        "PUT /tiered-expires HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nStream-TTL: 5\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    let body = "x".repeat(20 * 1024);
+    let appended = server.request(&format!(
+        "POST /tiered-expires HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    assert!(appended.starts_with("HTTP/1.1 2"), "{appended}");
+
+    let streams = dir.join("streams");
+    let remote_keys = || -> Vec<String> {
+        let mut keys = Vec::new();
+        for entry in std::fs::read_dir(&streams)
+            .expect("streams directory")
+            .flatten()
+        {
+            if !entry.file_name().to_string_lossy().ends_with(".meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            for segment in meta["segments"].as_array().into_iter().flatten() {
+                if let Some(key) = segment["remote_key"].as_str() {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+        keys
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut keys = remote_keys();
+    while keys.len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        keys = remote_keys();
+    }
+    assert!(keys.len() >= 2, "expected offloaded pieces, got {keys:?}");
+    for key in &keys {
+        assert!(key.starts_with(&prefix), "{key}");
+        assert!(exists(key), "offloaded piece {key} is not in the bucket");
+    }
+
+    let stream_artifacts = || -> Vec<String> {
+        std::fs::read_dir(&streams)
+            .expect("streams directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while (!stream_artifacts().is_empty() || keys.iter().any(|key| exists(key)))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(stream_artifacts(), Vec::<String>::new(), "left on the SSD");
+    let left: Vec<&String> = keys.iter().filter(|key| exists(key)).collect();
+    assert!(left.is_empty(), "left in the bucket: {left:?}");
+    drop(server);
 }
 
 #[test]

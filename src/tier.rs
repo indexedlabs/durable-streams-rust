@@ -356,6 +356,101 @@ fn segment_key(prefix: &str, st: &StreamState, logical_start: u64) -> String {
     format!("{prefix}{fname}/{logical_start:016}")
 }
 
+/// Test hook: runs as a compaction reaches its intent write, so a test can
+/// fence the stream inside the pass as a racing DELETE would.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static COMPACTION_INTENT_HOOK: Mutex<Option<Box<dyn Fn(&Arc<StreamState>) + Send>>> =
+    Mutex::new(None);
+
+/// Suffix of a stream incarnation's pending tier-delete note, kept beside its
+/// `.meta` sidecar as `<data file>.tier-delete`.
+pub(crate) const TIER_DELETE_NOTE_SUFFIX: &str = ".tier-delete";
+
+/// A pending tier delete: the remote keys of one stream incarnation, written
+/// durably before any of them, or the stream's local state, is removed, and
+/// cleared once they are all deleted. Startup finishes every note it finds.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TierDeleteNote {
+    keys: Vec<String>,
+}
+
+/// The pending tier-delete note of the stream whose data file is `data_path`.
+pub(crate) fn tier_delete_note_path(data_path: &std::path::Path) -> PathBuf {
+    let mut p = data_path.as_os_str().to_owned();
+    p.push(TIER_DELETE_NOTE_SUFFIX);
+    PathBuf::from(p)
+}
+
+/// The data file a pending tier-delete note belongs to.
+pub(crate) fn tier_delete_note_data_path(note_path: &std::path::Path) -> PathBuf {
+    let note = note_path.as_os_str().to_string_lossy();
+    let data: &str = note.strip_suffix(TIER_DELETE_NOTE_SUFFIX).unwrap_or(&note);
+    PathBuf::from(data)
+}
+
+/// Write a note crash-durably: an fsynced temp file renamed into place, then
+/// its directory fsynced.
+fn write_tier_delete_note(path: &std::path::Path, note: &TierDeleteNote) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(note).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    crate::store::fsync_parent_dir(path)
+}
+
+/// The object keys a pending tier-delete note names.
+async fn read_tier_delete_note(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let bytes = tokio::fs::read(path).await?;
+    let note: TierDeleteNote = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    Ok(note.keys)
+}
+
+/// Clear a note once its deletes are done. Its stream's sidecar and data file
+/// share its directory: fsync it first, so a crash can never bring back a
+/// sidecar that lists deleted objects with no note left to finish it.
+fn clear_tier_delete_note(path: &std::path::Path) -> std::io::Result<()> {
+    crate::store::fsync_parent_dir(path)?;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Remove every staged chunk file (`<data file>.seg.<start>`, and its `.tmp`)
+/// of the stream whose data file is named `file_name`.
+async fn remove_chunk_files(seg_dir: &std::path::Path, file_name: &str) {
+    let file_prefix = format!("{file_name}.seg.");
+    if let Ok(mut rd) = tokio::fs::read_dir(seg_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&file_prefix))
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+}
+
+/// The key a segment's object is under: the one recorded when it was offloaded,
+/// which outlives a later change of `--tier-key-prefix`, or for a segment not
+/// yet flipped to Remote, the key its upload uses now.
+fn object_key(prefix: &str, st: &StreamState, seg: &SegmentEntry) -> String {
+    match &seg.placement {
+        Placement::Remote(key) => key.clone(),
+        Placement::Local(_) => segment_key(prefix, st, seg.logical_start),
+    }
+}
+
 /// Local staged chunk-file name for a sealed segment.
 fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
     let fname = st
@@ -441,7 +536,9 @@ impl Store {
     /// No-op when `compact_bytes == 0` or nothing is reclaimable.
     async fn maybe_compact(self: &Arc<Self>, st: &Arc<StreamState>) -> std::io::Result<()> {
         let threshold = self.tier_config.compact_bytes;
-        if threshold == 0 {
+        // A fenced stream's sidecar writes are skipped, so its compaction intent
+        // would never become durable: leave its live file as it is.
+        if threshold == 0 || st.is_fenced() {
             return Ok(());
         }
         // Separate acquisitions (never nest manifest+shared — see seal_loop note).
@@ -500,6 +597,10 @@ impl Store {
             .map_err(std::io::Error::other)??;
         }
 
+        #[cfg(test)]
+        if let Some(hook) = COMPACTION_INTENT_HOOK.lock().unwrap().as_ref() {
+            hook(st);
+        }
         // 2) Persist the compaction intent BEFORE the destructive rename, so a
         //    crash anywhere after this is recoverable (tail is frozen).
         *st.compaction.lock().unwrap() = Some(crate::store::PendingCompaction {
@@ -511,6 +612,16 @@ impl Store {
             tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
                 .await
                 .map_err(std::io::Error::other)??;
+        }
+
+        // A fence that landed during this pass skipped that write: stop before
+        // the rename, or the sidecar's `file_base` would no longer match the
+        // live file. A durable intent with the old file intact recovers as a
+        // compaction that never renamed.
+        if st.is_fenced() {
+            *st.compaction.lock().unwrap() = None;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(());
         }
 
         // 3) Atomic content swap, made crash-durable. In-flight readers keep the
@@ -576,8 +687,10 @@ impl Store {
             let sealed_offset = {
                 let m = st.tier.manifest.lock().unwrap();
                 // Hard delete arrived mid-pass: stop staging/uploading and let
-                // `gc_remote_segments` reclaim from here.
-                if m.deleted {
+                // `gc_remote_segments` reclaim from here. A fenced stream's
+                // sidecar writes are skipped, so a segment sealed now would be
+                // listed nowhere on disk: stop at the fence too.
+                if m.deleted || st.is_fenced() {
                     return Ok(());
                 }
                 m.sealed_offset.max(st.base_offset)
@@ -702,8 +815,11 @@ impl Store {
         };
         // Hard delete arrived: don't upload an object the GC pass would have to
         // chase (it deletes by deterministic key, but skipping the put avoids the
-        // orphan window entirely).
-        if st.tier.manifest.lock().unwrap().deleted {
+        // orphan window entirely). Nor once the stream is fenced: its sidecar
+        // writes are skipped from then on, so an object uploaded now may be
+        // listed nowhere on disk. A fence is never lifted, so an unfenced stream
+        // here means the sidecar write listing this segment was really made.
+        if st.is_fenced() || st.tier.manifest.lock().unwrap().deleted {
             return Ok(());
         }
         let key = segment_key(&self.tier_config.key_prefix, st, seg_start);
@@ -743,6 +859,11 @@ impl Store {
         tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
             .await
             .map_err(std::io::Error::other)??;
+        // A fence that landed during the upload skipped that write, so the
+        // sidecar may still list the segment as Local: keep its chunk.
+        if st.is_fenced() {
+            return Ok(());
+        }
         // Now the local chunk file is reclaimable. unlink is safe even with
         // in-flight reads (open fds stay valid after unlink on Unix).
         if let Some(p) = local_path {
@@ -751,9 +872,113 @@ impl Store {
         Ok(())
     }
 
+    /// Durably record the delete of a hard-deleted stream's remote objects
+    /// before any of them, or its local state, is removed. Marks the stream
+    /// deleted first, under the manifest lock it snapshots under, so no seal or
+    /// offload pass uploads an object the note does not name. Returns whether a
+    /// note was written: a stream that never sealed, or a store with no remote
+    /// tier, has no object to delete.
+    pub(crate) fn record_tier_delete(&self, st: &Arc<StreamState>) -> std::io::Result<bool> {
+        if !self.tier_config.enabled() || self.blobstore.is_none() {
+            return Ok(false);
+        }
+        let keys: Vec<String> = {
+            let mut m = st.tier.manifest.lock().unwrap();
+            m.deleted = true;
+            m.segments
+                .iter()
+                .map(|s| object_key(&self.tier_config.key_prefix, st, s))
+                .collect()
+        };
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        write_tier_delete_note(
+            &tier_delete_note_path(&st.file_path),
+            &TierDeleteNote { keys },
+        )?;
+        Ok(true)
+    }
+
+    /// Finish every tier delete a crash interrupted, before the store serves:
+    /// delete the objects each pending note names and its stream's staged
+    /// chunk files, then clear the note. Recovery already removed each noted
+    /// stream's sidecar and data file. A note whose deletes fail is kept, and
+    /// the next start tries again.
+    pub async fn finish_pending_tier_deletes(&self) {
+        let notes = std::mem::take(&mut *self.pending_tier_deletes.lock().unwrap());
+        if notes.is_empty() {
+            return;
+        }
+        let Some(bs) = &self.blobstore else {
+            eprintln!(
+                "WARN: {} pending tier delete(s) kept: no remote tier is configured",
+                notes.len()
+            );
+            return;
+        };
+        // Stop at the first failed object delete: an unreachable bucket fails
+        // every note, each only after the client's whole retry budget, and the
+        // store is not serving yet. The failed note and the rest stay for the
+        // next start. A note that cannot be read is a local, permanent error:
+        // skip it (it stays on disk) rather than hold back the notes after it.
+        let total = notes.len();
+        let mut finished = 0usize;
+        for (i, note) in notes.iter().enumerate() {
+            let keys = match read_tier_delete_note(note).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    eprintln!(
+                        "recovery: pending tier delete {}/{total} skipped, its note is unreadable ({e}): {}",
+                        i + 1,
+                        note.display()
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = self.finish_tier_delete(bs, note, &keys).await {
+                eprintln!(
+                    "recovery: pending tier delete {}/{total} kept for the next start ({e}), with the {} after it: {}",
+                    i + 1,
+                    total - i - 1,
+                    note.display()
+                );
+                return;
+            }
+            finished += 1;
+            eprintln!(
+                "recovery: pending tier delete {}/{total} finished: {}",
+                i + 1,
+                note.display()
+            );
+        }
+        eprintln!("recovery: finished {finished} of {total} pending tier delete(s)");
+    }
+
+    async fn finish_tier_delete(
+        &self,
+        bs: &crate::blobstore::SharedBlobStore,
+        note_path: &std::path::Path,
+        keys: &[String],
+    ) -> std::io::Result<()> {
+        for key in keys {
+            bs.delete(key).await?;
+        }
+        let data_path = tier_delete_note_data_path(note_path);
+        if let Some(file_name) = data_path.file_name().and_then(|n| n.to_str()) {
+            remove_chunk_files(&self.segments_dir(), file_name).await;
+        }
+        let note_path = note_path.to_path_buf();
+        tokio::task::spawn_blocking(move || clear_tier_delete_note(&note_path))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     /// Delete every remote object backing a hard-deleted stream's sealed
-    /// segments. Called only on hard delete (ref_count == 0).
-    pub fn gc_remote_segments(&self, st: &Arc<StreamState>) {
+    /// segments, then clear its pending tier-delete note when `noted` (see
+    /// `record_tier_delete`). A failed delete keeps the note for the next
+    /// start. Called only on hard delete (ref_count == 0).
+    pub fn gc_remote_segments(&self, st: &Arc<StreamState>, noted: bool) {
         if !self.tier_config.enabled() {
             return;
         }
@@ -769,13 +994,13 @@ impl Store {
         // Deterministic on-disk prefix for this stream's chunk files
         // (`<fname>.seg.<start>`), used as a GC backstop for chunks staged on disk
         // but not yet in the manifest snapshot.
-        let file_prefix = format!(
-            "{}.seg.",
-            st.file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("stream")
-        );
+        let file_name = st
+            .file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("stream")
+            .to_string();
+        let note = noted.then(|| tier_delete_note_path(&st.file_path));
         let st = st.clone();
         tokio::spawn(async move {
             // Wait out any pass that was already inside its offloading window so we
@@ -788,6 +1013,12 @@ impl Store {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
+            // A pass still in flight may yet land an upload after the deletes
+            // below; keep the note so the next start deletes it again.
+            let upload_in_flight = st.tier.manifest.lock().unwrap().offloading;
+            if upload_in_flight && note.is_some() {
+                tracing::warn!(stream = %st.path, "tier upload still in flight at delete; its pending-delete note is kept for the next start");
+            }
             // Snapshot the final segment set. Delete EVERY segment's remote object
             // by its deterministic key — this covers an object that was uploaded
             // just before a pass bailed but not yet flipped to `Remote` (a plain
@@ -798,7 +1029,7 @@ impl Store {
                 let keys = m
                     .segments
                     .iter()
-                    .map(|s| segment_key(&prefix, &st, s.logical_start))
+                    .map(|s| object_key(&prefix, &st, s))
                     .collect();
                 let local = m
                     .segments
@@ -811,9 +1042,13 @@ impl Store {
                 (keys, local)
             };
             // Remote deletes (only when a blobstore is configured)…
+            let mut all_deleted = !upload_in_flight;
             if let Some(bs) = bs {
                 for k in keys {
-                    let _ = bs.delete(&k).await;
+                    if let Err(e) = bs.delete(&k).await {
+                        all_deleted = false;
+                        tracing::warn!(stream = %st.path, key = %k, error = %e, "tier object delete failed; its pending-delete note is kept for the next start");
+                    }
                 }
             }
             // …and unlink any still-staged local chunk files (reclaimed even for a
@@ -824,14 +1059,16 @@ impl Store {
             // Backstop sweep: remove any chunk file of this stream the manifest
             // snapshot missed — e.g. a chunk staged on disk before it was recorded
             // when a seal pass was cut short, or a leftover `.tmp` write.
-            if let Ok(mut rd) = tokio::fs::read_dir(&seg_dir).await {
-                while let Ok(Some(entry)) = rd.next_entry().await {
-                    if entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with(&file_prefix))
-                    {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
+            remove_chunk_files(&seg_dir, &file_name).await;
+            // Every object is gone: the note has nothing left to finish.
+            if let Some(note) = note.filter(|_| all_deleted) {
+                match tokio::task::spawn_blocking(move || clear_tier_delete_note(&note)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(stream = %st.path, error = %e, "tier delete note not cleared; the next start finishes it")
+                    }
+                    Err(e) => {
+                        tracing::warn!(stream = %st.path, error = %e, "tier delete note clear task failed; the next start finishes it")
                     }
                 }
             }
@@ -875,7 +1112,10 @@ impl TierTask {
             // Hard delete arrived mid-backlog: stop uploading (GC owns reclaim now)
             // and fall through to clear `offloading`, so the GC bounded wait sees
             // offloading==false promptly instead of timing out and racing our puts.
-            if st.tier.manifest.lock().unwrap().deleted {
+            // A fenced stream (a recovered soft-deleted fork parent, say) uploads
+            // nothing either: its sidecar writes are skipped, so the flip below
+            // would never be durable.
+            if st.is_fenced() || st.tier.manifest.lock().unwrap().deleted {
                 break;
             }
             let payload = match tokio::fs::read(&path).await {
@@ -906,6 +1146,8 @@ impl TierTask {
             // Local pointing at a file that no longer exists — the segment
             // becomes permanently unreadable even though the object is in S3.
             match tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await {
+                // A fence that landed meanwhile skipped the write: keep the chunk.
+                Ok(Ok(())) if st.is_fenced() => {}
                 Ok(Ok(())) => {
                     let _ = tokio::fs::remove_file(&path).await;
                 }

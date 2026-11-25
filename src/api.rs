@@ -73,6 +73,7 @@ pub enum Method {
     Post,
     Delete,
     Head,
+    Patch,
     Options,
     Other,
 }
@@ -85,6 +86,7 @@ impl Method {
             "POST" => Method::Post,
             "DELETE" => Method::Delete,
             "HEAD" => Method::Head,
+            "PATCH" => Method::Patch,
             "OPTIONS" => Method::Options,
             _ => Method::Other,
         }

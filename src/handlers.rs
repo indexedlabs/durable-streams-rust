@@ -334,6 +334,7 @@ fn method_label(m: Method) -> &'static str {
         Method::Post => "POST",
         Method::Delete => "DELETE",
         Method::Head => "HEAD",
+        Method::Patch => "PATCH",
         Method::Options => "OPTIONS",
         Method::Other => "other",
     }
@@ -440,6 +441,7 @@ async fn dispatch(
             Method::Post => handle_append(store, req, path).await,
             Method::Get => handle_read(store, req, path).await,
             Method::Head => handle_head(store, path).await,
+            Method::Patch => handle_patch(store, req, path).await,
             Method::Delete => handle_delete(store, path).await,
             Method::Options => unreachable!("OPTIONS handled before route dispatch"),
             Method::Other => text_response(405, "method not allowed"),
@@ -455,7 +457,7 @@ fn cors_preflight() -> Resp {
     ResponseBuilder::new(204)
         .hs(
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, HEAD, OPTIONS",
+            "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
         )
         .hs(
             "access-control-allow-headers",
@@ -3071,6 +3073,7 @@ async fn handle_head(store: Arc<Store>, path: String) -> Resp {
     };
     // HEAD must not reset the TTL.
     let t = st.tail();
+    let tier_after_idle = st.shared.read().unwrap().tier_after_idle;
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(t.bytes))
@@ -3081,13 +3084,55 @@ async fn handle_head(store: Arc<Store>, path: String) -> Resp {
     if let Some(raw) = &st.config.expires_at_raw {
         b = b.h(H_EXPIRES_AT, raw.clone());
     }
-    if let Some(idle) = st.config.tier_after_idle {
+    if let Some(idle) = tier_after_idle {
         b = b.h(H_TIER_AFTER_IDLE, idle.to_string());
     }
     if t.closed {
         b = b.hs(H_CLOSED, "true");
     }
     b.body(empty())
+}
+
+// ---------- PATCH (idle time) ----------
+
+/// The only change to a stream's settings after create. Neither a read nor a
+/// write: it restarts no TTL and leaves the data file alone.
+async fn handle_patch(store: Arc<Store>, req: Req, path: String) -> Resp {
+    let tier_after_idle = match header_str(&req, H_TIER_AFTER_IDLE) {
+        Some("default") => None,
+        Some(v) => match parse_tier_after_idle(v) {
+            Ok(idle) => Some(idle),
+            Err(_) => return text_response(400, "invalid Stream-Tier-After-Idle"),
+        },
+        None => return text_response(400, "PATCH requires Stream-Tier-After-Idle"),
+    };
+    loop {
+        let lookup_now = SystemTime::now();
+        let st = match store.lookup_at(&path, lookup_now, false) {
+            StreamLookup::Live(stream) => stream,
+            StreamLookup::Gone(_) => return gone(),
+            StreamLookup::Missing => return text_response(404, "stream not found"),
+            StreamLookup::Expired(candidate) => {
+                enqueue_expired_before_not_found(&store, &candidate, lookup_now).await;
+                return text_response(404, "stream not found");
+            }
+        };
+        let stream_id = st.id;
+        // Blocking pool, as create's durable sidecar write is.
+        match tokio::task::spawn_blocking(move || set_tier_after_idle_sync(&st, tier_after_idle))
+            .await
+        {
+            Ok(Ok(true)) => return ResponseBuilder::new(204).body(empty()),
+            // Retired since the lookup. A fenced stream never looks up as live
+            // again, so this answers for whatever the path holds now.
+            Ok(Ok(false)) => continue,
+            Ok(Err(error)) => {
+                tracing::error!(%error, stream_id, "idle time change failed");
+                return text_response(500, "idle time change not durable");
+            }
+            Err(_) => return text_response(500, "idle time change task failed"),
+        }
+    }
 }
 
 // ---------- DELETE ----------

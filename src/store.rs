@@ -1052,19 +1052,18 @@ impl Store {
         };
         let scan_bound = limit.saturating_mul(10);
         let mut entries = Vec::new();
-        let mut examined = 0;
         let mut last_examined: Option<&str> = None;
         let mut resume = None;
-        for (path, entry) in inventory
+        for (examined, (path, entry)) in inventory
             .entries
             .range((start, std::ops::Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(prefix))
+            .enumerate()
         {
             if entries.len() == limit || examined == scan_bound {
                 resume = last_examined.map(str::to_owned);
                 break;
             }
-            examined += 1;
             last_examined = Some(path.as_str());
             if !(live_only && entry.deleted) {
                 entries.push(entry.clone());

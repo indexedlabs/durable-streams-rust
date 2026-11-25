@@ -2952,16 +2952,21 @@ impl crate::api::EventSource for SseSource {
         Box::pin(self.next())
     }
 
-    /// Live-tail subscribers (root stream, tiering off, start at/after the live
-    /// file base) are served by the epoll reactor: the connection task hands off
-    /// the socket and frees its future. Everything else (cold catch-up from a
-    /// forked/compacted/tiered range) stays on the inline hand-off path.
+    /// Live-tail subscribers (root stream, start at/after both the live file
+    /// base and the sealed offset) are served by the epoll reactor: the
+    /// connection task hands off the socket and frees its future. A configured
+    /// bucket doesn't matter here; only a read that starts below the sealed
+    /// offset needs the cold path. Everything else (cold catch-up from a
+    /// forked/compacted/sealed range) stays on the inline hand-off path.
     #[cfg(target_os = "linux")]
     fn reactor_reg(&self) -> Option<crate::api::SseReg> {
-        if self.st.parent.is_some() || self.st.blobstore.is_some() {
+        if self.st.parent.is_some() {
             return None;
         }
-        if self.start < self.st.shared.read().unwrap().file_base {
+        // Separate acquisitions (never nest manifest+shared — see seal_loop).
+        let sealed = self.st.tier.manifest.lock().unwrap().sealed_offset;
+        let file_base = self.st.shared.read().unwrap().file_base;
+        if self.start < file_base.max(sealed) {
             return None;
         }
         Some(crate::api::SseReg {

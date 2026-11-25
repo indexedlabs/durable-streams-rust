@@ -1024,13 +1024,16 @@ impl Store {
         generation: Option<u64>,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
+    ) -> Result<(u64, Vec<InventoryEntry>, Option<String>), InventoryPageError> {
         self.inventory_page_under("", generation, after, limit, false)
     }
-    /// One page of the paths starting with `prefix`, strictly after `after`.
+    /// One page of the paths starting with `prefix`, strictly after `after`,
+    /// and the path the next page resumes after, if any rows remain.
     /// A `generation` fences the page to the inventory version the listing
     /// began at; `None` pages by path alone, so a listing survives writes.
     /// `live_only` omits soft-deleted streams (tombstones kept for forks).
+    /// A page examines at most `limit * 10` entries under the read lock, so a
+    /// run of tombstones can end a page early, even empty, with a resume path.
     pub fn inventory_page_under(
         &self,
         prefix: &str,
@@ -1038,7 +1041,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         live_only: bool,
-    ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
+    ) -> Result<(u64, Vec<InventoryEntry>, Option<String>), InventoryPageError> {
         let inventory = self.inventory.read().unwrap();
         if generation.is_some_and(|generation| generation != inventory.generation) {
             return Err(InventoryPageError::GenerationChanged);
@@ -1047,20 +1050,27 @@ impl Store {
             Some(after) if after >= prefix => std::ops::Bound::Excluded(after.to_owned()),
             _ => std::ops::Bound::Included(prefix.to_owned()),
         };
-        let entries: Vec<_> = inventory
+        let scan_bound = limit.saturating_mul(10);
+        let mut entries = Vec::new();
+        let mut examined = 0;
+        let mut last_examined: Option<&str> = None;
+        let mut resume = None;
+        for (path, entry) in inventory
             .entries
             .range((start, std::ops::Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(prefix))
-            .filter(|(_, entry)| !(live_only && entry.deleted))
-            .take(limit + 1)
-            .map(|(_, entry)| entry.clone())
-            .collect();
-        let more = entries.len() > limit;
-        Ok((
-            inventory.generation,
-            entries.into_iter().take(limit).collect(),
-            more,
-        ))
+        {
+            if entries.len() == limit || examined == scan_bound {
+                resume = last_examined.map(str::to_owned);
+                break;
+            }
+            examined += 1;
+            last_examined = Some(path.as_str());
+            if !(live_only && entry.deleted) {
+                entries.push(entry.clone());
+            }
+        }
+        Ok((inventory.generation, entries, resume))
     }
     /// Build a Store with an explicit tiering configuration. When
     /// `tier.kind == Off` (the default) this is identical to `new`: no

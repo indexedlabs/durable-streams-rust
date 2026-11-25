@@ -486,6 +486,13 @@ mod cors_policy_tests {
     }
 }
 
+/// `GET /_admin/inventory`: one page of streams in path order, with
+/// `next_cursor` while more remain. `prefix` narrows the listing to paths
+/// starting with it. A stable listing is fenced: a later page answers 409 once
+/// the store changed. `stable=false` pages past writes and omits soft-deleted
+/// streams; a page examines a bounded number of entries, so a run of
+/// tombstones can return fewer than `limit` rows, even none, with a
+/// `next_cursor` to page on from.
 fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
     const DEFAULT_LIMIT: usize = 100;
     const MAX_LIMIT: usize = 1000;
@@ -523,7 +530,7 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
     // A stable listing is fenced to the inventory version its first page
     // saw; `stable=false` pages on from the cursor's path whatever changed,
     // and lists only streams that exist, never soft-deleted tombstones.
-    let (generation, entries, more) = match store.inventory_page_under(
+    let (generation, entries, resume) = match store.inventory_page_under(
         &prefix,
         cursor
             .as_ref()
@@ -538,13 +545,7 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
             return text_response(409, "inventory changed; restart pagination")
         }
     };
-    let next_cursor = if more {
-        entries
-            .last()
-            .map(|entry| encode_inventory_cursor(generation, &entry.path))
-    } else {
-        None
-    };
+    let next_cursor = resume.map(|path| encode_inventory_cursor(generation, &path));
     #[derive(serde::Serialize)]
     struct Item<'a> {
         path: &'a str,

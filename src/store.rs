@@ -1023,19 +1023,30 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
+        self.inventory_page_under("", generation, after, limit)
+    }
+    /// One page of the paths starting with `prefix`, strictly after `after`.
+    /// A `generation` fences the page to the inventory version the listing
+    /// began at; `None` pages by path alone, so a listing survives writes.
+    pub fn inventory_page_under(
+        &self,
+        prefix: &str,
+        generation: Option<u64>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
         let inventory = self.inventory.read().unwrap();
         if generation.is_some_and(|generation| generation != inventory.generation) {
             return Err(InventoryPageError::GenerationChanged);
         }
+        let start = match after {
+            Some(after) if after >= prefix => std::ops::Bound::Excluded(after.to_owned()),
+            _ => std::ops::Bound::Included(prefix.to_owned()),
+        };
         let entries: Vec<_> = inventory
             .entries
-            .range((
-                match after {
-                    Some(after) => std::ops::Bound::Excluded(after.to_owned()),
-                    None => std::ops::Bound::Unbounded,
-                },
-                std::ops::Bound::Unbounded,
-            ))
+            .range((start, std::ops::Bound::Unbounded))
+            .take_while(|(path, _)| path.starts_with(prefix))
             .take(limit + 1)
             .map(|(_, entry)| entry.clone())
             .collect();

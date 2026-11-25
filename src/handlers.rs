@@ -491,6 +491,8 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
     const MAX_LIMIT: usize = 1000;
     let mut cursor: Option<(u64, String)> = None;
     let mut limit = DEFAULT_LIMIT;
+    let mut prefix = String::new();
+    let mut stable = true;
     if let Some(query) = query {
         for part in query.split('&') {
             let Some((key, value)) = part.split_once('=') else {
@@ -505,12 +507,27 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
                     Ok(n) if (1..=MAX_LIMIT).contains(&n) => limit = n,
                     _ => return text_response(400, "inventory limit must be 1..=1000"),
                 },
+                "prefix" => match percent_encoding::percent_decode_str(value).decode_utf8() {
+                    Ok(value) => prefix = value.into_owned(),
+                    Err(_) => return text_response(400, "invalid inventory prefix"),
+                },
+                "stable" => match value {
+                    "true" => stable = true,
+                    "false" => stable = false,
+                    _ => return text_response(400, "inventory stable must be true or false"),
+                },
                 _ => return text_response(400, "unknown inventory query parameter"),
             }
         }
     }
-    let (generation, entries, more) = match store.inventory_page(
-        cursor.as_ref().map(|(generation, _)| *generation),
+    // A stable listing is fenced to the inventory version its first page
+    // saw; `stable=false` pages on from the cursor's path whatever changed.
+    let (generation, entries, more) = match store.inventory_page_under(
+        &prefix,
+        cursor
+            .as_ref()
+            .filter(|_| stable)
+            .map(|(generation, _)| *generation),
         cursor.as_ref().map(|(_, path)| path.as_str()),
         limit,
     ) {
@@ -3374,7 +3391,7 @@ mod admin_inventory_tests {
         );
         for path in existing.iter().filter(|path| **path != "a.5") {
             assert_eq!(
-                listed.iter().filter(|listed| listed == path).count(),
+                listed.iter().filter(|seen| seen == path).count(),
                 1,
                 "{path} existed throughout and is listed exactly once: {listed:?}"
             );

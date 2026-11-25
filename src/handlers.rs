@@ -4670,6 +4670,378 @@ mod memory_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn idle_patch(path: &str, idle: Option<&str>) -> Req {
+        Req {
+            method: Method::parse("PATCH"),
+            path: path.into(),
+            query: None,
+            headers: idle
+                .map(|idle| ("stream-tier-after-idle".to_string(), idle.to_string()))
+                .into_iter()
+                .collect(),
+            body: Bytes::new(),
+        }
+    }
+
+    async fn patch_status(store: &Arc<Store>, path: &str, idle: Option<&str>) -> u16 {
+        handle(Arc::clone(store), idle_patch(path, idle))
+            .await
+            .status
+    }
+
+    fn sidecar(stream: &StreamState) -> serde_json::Value {
+        let bytes = std::fs::read(crate::store::meta_path(&stream.file_path)).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_changes_tier_after_idle_and_survives_restart() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle");
+        let mut store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/own", Some("60")))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/none", None))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            head_idle(&store, "idle/own").await,
+            (200, Some("60".into()))
+        );
+
+        // Each row is what HEAD returns and what the sidecar holds: seconds as
+        // a number, `never`, or no key at all. Every value is repeated, and each
+        // is read back by a new store.
+        for (idle, head, in_sidecar) in [
+            ("never", Some("never"), Some(serde_json::json!("never"))),
+            ("default", None, None),
+            ("600", Some("600"), Some(serde_json::json!(600))),
+            ("0", Some("0"), Some(serde_json::json!(0))),
+            (
+                "18446744073709551615",
+                Some("18446744073709551615"),
+                Some(serde_json::json!(u64::MAX)),
+            ),
+            ("default", None, None),
+        ] {
+            for path in ["idle/own", "idle/none"] {
+                let expected = (200, head.map(str::to_string));
+                assert_eq!(
+                    patch_status(&store, path, Some(idle)).await,
+                    204,
+                    "{path} {idle}"
+                );
+                assert_eq!(head_idle(&store, path).await, expected, "{path} {idle}");
+                let stream = store.streams.get(path).unwrap().clone();
+                let written = sidecar(&stream);
+                assert_eq!(
+                    written.get("tier_after_idle"),
+                    in_sidecar.as_ref(),
+                    "{path} {idle}"
+                );
+
+                assert_eq!(
+                    patch_status(&store, path, Some(idle)).await,
+                    204,
+                    "{path} {idle} repeated"
+                );
+                assert_eq!(head_idle(&store, path).await, expected, "{path} {idle}");
+                assert_eq!(
+                    sidecar(&stream),
+                    written,
+                    "repeating {path} {idle} changes nothing"
+                );
+            }
+
+            drop(store);
+            store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+            for path in ["idle/own", "idle/none"] {
+                assert_eq!(
+                    head_idle(&store, path).await,
+                    (200, head.map(str::to_string)),
+                    "{path} {idle} after restart"
+                );
+            }
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_later_sidecar_write_keeps_the_patched_tier_after_idle() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-rewrite");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/rewrite", Some("60")))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            patch_status(&store, "idle/rewrite", Some("never")).await,
+            204
+        );
+
+        // A whole-sidecar write and a create that meets the stream, each after
+        // the change, both leave it.
+        let stream = store.streams.get("idle/rewrite").unwrap().clone();
+        write_meta_sync(&stream, true).unwrap();
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/rewrite", Some("60")))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            head_idle(&store, "idle/rewrite").await,
+            (200, Some("never".into()))
+        );
+        assert_eq!(sidecar(&stream)["tier_after_idle"], "never");
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_is_neither_a_read_nor_a_write() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-not-activity");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let mut put = idle_put("idle/ttl", Some("60"));
+        put.headers.push(("stream-ttl".into(), "100".into()));
+        put.body = Bytes::from_static(b"bytes");
+        assert_eq!(handle(Arc::clone(&store), put).await.status, 201);
+        let stream = store.streams.get("idle/ttl").unwrap().clone();
+
+        // The stream was written an hour ago and read 40 seconds ago, and that
+        // read is not in the sidecar yet: an append or close still waiting for
+        // its durability would be the same unflushed state.
+        std::fs::File::options()
+            .write(true)
+            .open(&stream.file_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let last_write = std::fs::metadata(&stream.file_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let last_access = SystemTime::now() - Duration::from_secs(40);
+        {
+            let mut shared = stream.shared.write().unwrap();
+            shared.last_access = last_access;
+            shared.last_seq_header = Some("unflushed".into());
+        }
+        let mut expected = sidecar(&stream);
+
+        for idle in ["never", "600", "default"] {
+            assert_eq!(patch_status(&store, "idle/ttl", Some(idle)).await, 204);
+        }
+
+        assert_eq!(stream.shared.read().unwrap().last_access, last_access);
+        assert!(!stream.is_expired_at(last_access + Duration::from_secs(100)));
+        assert!(stream.is_expired_at(last_access + Duration::from_secs(101)));
+        let data_file = std::fs::metadata(&stream.file_path).unwrap();
+        assert_eq!(data_file.modified().unwrap(), last_write);
+        assert_eq!(data_file.len(), 5);
+        assert_eq!(stream.tail().bytes, 5);
+        // Nothing but the idle time moved in the sidecar, `last_access_unix`
+        // and the unflushed fields included.
+        expected.as_object_mut().unwrap().remove("tier_after_idle");
+        assert_eq!(sidecar(&stream), expected);
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_with_a_missing_or_bad_tier_after_idle_answers_400() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-bad");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/bad", Some("60")))
+                .await
+                .status,
+            201
+        );
+        let stream = store.streams.get("idle/bad").unwrap().clone();
+        let before = sidecar(&stream);
+        for bad in [
+            None,
+            Some(""),
+            Some("soon"),
+            Some("-1"),
+            Some("01"),
+            Some("1.5"),
+            Some(" 60"),
+            Some("Never"),
+            Some("Default"),
+            Some("18446744073709551616"),
+        ] {
+            assert_eq!(patch_status(&store, "idle/bad", bad).await, 400, "{bad:?}");
+            assert_eq!(
+                head_idle(&store, "idle/bad").await,
+                (200, Some("60".into())),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(sidecar(&stream), before);
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_answers_what_head_answers_for_a_stream_that_is_not_live() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-not-live");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        assert_eq!(patch_status(&store, "idle/missing", Some("60")).await, 404);
+        assert_eq!(head_idle(&store, "idle/missing").await, (404, None));
+        assert!(store.streams.get("idle/missing").is_none());
+
+        // One expired stream for each request: the first to see one retires it.
+        for path in ["idle/expired-head", "idle/expired-patch"] {
+            let mut put = idle_put(path, Some("60"));
+            put.headers.push(("stream-ttl".into(), "1".into()));
+            assert_eq!(handle(Arc::clone(&store), put).await.status, 201);
+            let stream = store.streams.get(path).unwrap().clone();
+            stream.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+        }
+        assert_eq!(head_idle(&store, "idle/expired-head").await, (404, None));
+        assert_eq!(
+            patch_status(&store, "idle/expired-patch", Some("never")).await,
+            404
+        );
+        assert_eq!(head_idle(&store, "idle/expired-patch").await, (404, None));
+
+        // Deleted outright, and deleted while a fork still reads through it.
+        let mut fork = idle_put("idle/fork", None);
+        fork.headers
+            .push(("stream-forked-from".into(), "idle/deleted-parent".into()));
+        for put in [
+            idle_put("idle/deleted", Some("60")),
+            idle_put("idle/deleted-parent", Some("60")),
+            fork,
+        ] {
+            assert_eq!(handle(Arc::clone(&store), put).await.status, 201);
+        }
+        for (path, status) in [("idle/deleted", 404), ("idle/deleted-parent", 410)] {
+            let delete = Req {
+                method: Method::Delete,
+                path: path.into(),
+                query: None,
+                headers: vec![],
+                body: Bytes::new(),
+            };
+            assert_eq!(handle(Arc::clone(&store), delete).await.status, 204);
+            assert_eq!(head_idle(&store, path).await, (status, None), "{path}");
+            assert_eq!(
+                patch_status(&store, path, Some("never")).await,
+                status,
+                "{path}"
+            );
+        }
+        let parent = store.streams.get("idle/deleted-parent").unwrap().clone();
+        assert_eq!(sidecar(&parent)["tier_after_idle"], 60);
+
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn patch_that_meets_a_delete_answers_as_head_and_leaves_no_sidecar() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-delete-race");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(Arc::clone(&store), idle_put("idle/race", Some("60")))
+                .await
+                .status,
+            201
+        );
+        let stream = store.streams.get("idle/race").unwrap().clone();
+
+        // Park the PATCH at the sidecar, past its lookup, until the delete has
+        // fenced the stream.
+        let (patch, delete) = {
+            let _sidecar_writers = stream.meta_lock.lock().unwrap();
+            let patch = tokio::spawn(handle(
+                Arc::clone(&store),
+                idle_patch("idle/race", Some("never")),
+            ));
+            std::thread::sleep(Duration::from_millis(100));
+            let delete = tokio::spawn(handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Delete,
+                    path: "idle/race".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            ));
+            while !stream.is_fenced() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (patch, delete)
+        };
+
+        assert_eq!(patch.await.unwrap().status, 404);
+        assert_eq!(delete.await.unwrap().status, 204);
+        assert_eq!(head_idle(&store, "idle/race").await, (404, None));
+        assert!(!crate::store::meta_path(&stream.file_path).exists());
+        assert!(!stream.file_path.exists());
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_is_routed_for_stream_paths_only() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("patch-idle-routes");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for path in ["/_admin/inventory", "/_admin/ready"] {
+            assert_eq!(patch_status(&store, path, Some("60")).await, 405, "{path}");
+        }
+        let preflight = handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Options,
+                path: "idle/any".into(),
+                query: None,
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        assert!(preflight
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "access-control-allow-methods"
+                && value.split(", ").any(|method| method == "PATCH")));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expiry_fence_prevents_append_from_refreshing_last_access() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();

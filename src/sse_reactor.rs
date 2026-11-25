@@ -9,9 +9,11 @@
 //! entry plus the kernel socket. See
 //! `docs/superpowers/specs/2026-06-29-sse-reactor-flat-userspace-design.md`.
 //!
-//! Only the live-tail case runs here (root stream, tiering off, start at/after
-//! the live file base). Cold catch-up keeps the proven inline hand-off path in
-//! `engine_raw`.
+//! Only the live-tail case runs here (root stream, start at/after the live file
+//! base and the sealed offset, with or without a bucket configured). Cold
+//! catch-up keeps the proven inline hand-off path in `engine_raw`. If a sealing
+//! pass compacts a subscriber's unread bytes out of the live file, `produce`
+//! ends the stream and the client reconnects through the cold path.
 
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::fs::FileExt;

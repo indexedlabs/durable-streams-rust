@@ -1604,6 +1604,7 @@ mod tests {
                     forked_from: None,
                     fork_offset_raw: None,
                     fork_sub_offset: None,
+                    tier_after_idle: None,
                 },
                 None,
                 0,
@@ -1750,6 +1751,7 @@ mod tests {
                         forked_from: None,
                         fork_offset_raw: None,
                         fork_sub_offset: None,
+                        tier_after_idle: None,
                     },
                     None,
                     0,
@@ -1975,6 +1977,7 @@ mod tests {
                                 forked_from: None,
                                 fork_offset_raw: None,
                                 fork_sub_offset: None,
+                                tier_after_idle: None,
                             },
                             None,
                             0,
@@ -1999,6 +2002,7 @@ mod tests {
                                     forked_from: None,
                                     fork_offset_raw: None,
                                     fork_sub_offset: None,
+                                    tier_after_idle: None,
                                 },
                                 None,
                                 0,
@@ -2144,6 +2148,7 @@ mod tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let mut candidates = Vec::new();
         for path in ["buffered-a", "buffered-b"] {
@@ -2224,6 +2229,7 @@ mod tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let create_candidate = |path| {
             let stream = match store.create(path, stream_config(), None, 0).unwrap() {
@@ -2336,6 +2342,7 @@ mod tests {
             forked_from: forked_from.map(str::to_owned),
             fork_offset_raw: forked_from.map(|_| "0".into()),
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let parent_path = format!("{tag}-parent");
         let child_path = format!("{tag}-child");
@@ -2523,6 +2530,7 @@ mod tests {
             forked_from: forked_from.map(str::to_owned),
             fork_offset_raw: forked_from.map(|_| "0".into()),
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let parent_path = "soft-owner-race-parent";
         let child_path = "soft-owner-race-child";
@@ -2680,6 +2688,7 @@ mod tests {
             forked_from: forked_from.map(str::to_owned),
             fork_offset_raw: forked_from.map(|_| "0".into()),
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let parent = match store
             .create("cascade-parent", config(None), None, 0)

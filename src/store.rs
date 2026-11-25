@@ -4339,6 +4339,10 @@ mod tier_tests {
             (st.file_path.clone(), file_name, note, objects)
         };
         if unlink_local {
+            assert!(
+                objects_left < objects,
+                "the crash must leave objects deleted ({tag})"
+            );
             std::fs::remove_file(meta_path(&file_path)).unwrap();
             std::fs::remove_file(&file_path).unwrap();
             for name in files_under(&dir.join("cold"))

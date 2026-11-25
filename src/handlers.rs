@@ -2972,16 +2972,21 @@ impl crate::api::EventSource for SseSource {
         Box::pin(self.next())
     }
 
-    /// Live-tail subscribers (root stream, tiering off, start at/after the live
-    /// file base) are served by the epoll reactor: the connection task hands off
-    /// the socket and frees its future. Everything else (cold catch-up from a
-    /// forked/compacted/tiered range) stays on the inline hand-off path.
+    /// Live-tail subscribers (root stream, start at/after both the live file
+    /// base and the sealed offset) are served by the epoll reactor: the
+    /// connection task hands off the socket and frees its future. A configured
+    /// bucket doesn't matter here; only a read that starts below the sealed
+    /// offset needs the cold path. Everything else (cold catch-up from a
+    /// forked/compacted/sealed range) stays on the inline hand-off path.
     #[cfg(target_os = "linux")]
     fn reactor_reg(&self) -> Option<crate::api::SseReg> {
-        if self.st.parent.is_some() || self.st.blobstore.is_some() {
+        if self.st.parent.is_some() {
             return None;
         }
-        if self.start < self.st.shared.read().unwrap().file_base {
+        // Separate acquisitions (never nest manifest+shared — see seal_loop).
+        let sealed = self.st.tier.manifest.lock().unwrap().sealed_offset;
+        let file_base = self.st.shared.read().unwrap().file_base;
+        if self.start < file_base.max(sealed) {
             return None;
         }
         Some(crate::api::SseReg {
@@ -6178,5 +6183,411 @@ mod chunk_cap_tests {
         assert_eq!(next_offset(&resp), 256);
         assert!(!up_to_date(&resp), "a capped long-poll page is partial");
         assert_eq!(body_bytes(resp.body).await.len(), 256);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tier_live_reader_tests {
+    //! With a bucket configured, readers waiting on a stream's live tail keep the
+    //! fast path: SSE registers with the epoll reactor and long-poll is served
+    //! from the resident tail / live file. Only a read that starts below the
+    //! sealed offset takes the cold path, which returns the S3 bytes first.
+    use super::*;
+    use crate::api::{Method, Req};
+    use crate::store::Store;
+    use crate::tier::{TierConfig, TierKind};
+    use bytes::Bytes;
+    use std::io::Read;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let p = std::env::temp_dir().join(format!(
+            "ds-tier-live-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// A store with a bucket configured. The local blobstore stands in for S3:
+    /// the reactor gate only asks whether a blobstore is configured, never which.
+    /// 1 KiB segments and a 1 KiB compaction threshold, so a sealing pass also
+    /// drops the sealed bytes from the live file and they exist only in the bucket.
+    fn tiered_store(dir: &std::path::Path) -> Arc<Store> {
+        let tier = TierConfig {
+            kind: TierKind::Local,
+            segment_bytes: 1024,
+            compact_bytes: 1024,
+            local_dir: Some(dir.join("cold")),
+            ..Default::default()
+        };
+        let store = Store::new_with_tier(dir.to_path_buf(), tier).unwrap();
+        assert!(store.blobstore.is_some(), "the store must have a bucket");
+        Arc::new(store)
+    }
+
+    fn req(method: Method, path: &str, query: Option<String>, body: &[u8]) -> Req {
+        Req {
+            method,
+            path: path.to_string(),
+            query,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: Bytes::copy_from_slice(body),
+        }
+    }
+
+    async fn create(store: &Arc<Store>, path: &str) {
+        let resp = handle(Arc::clone(store), req(Method::Put, path, None, b"")).await;
+        assert_eq!(resp.status, 201, "create {path}");
+    }
+
+    async fn append(store: &Arc<Store>, path: &str, body: &[u8]) {
+        let resp = handle(Arc::clone(store), req(Method::Post, path, None, body)).await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "append to {path}: {}",
+            resp.status
+        );
+    }
+
+    async fn sse(store: &Arc<Store>, path: &str, offset: u64) -> Resp {
+        let query = Some(format!("live=sse&offset={}", format_offset(offset)));
+        handle(Arc::clone(store), req(Method::Get, path, query, b"")).await
+    }
+
+    fn reactor_reg(resp: &Resp) -> Option<crate::api::SseReg> {
+        let Body::Sse(source) = &resp.body else {
+            panic!("expected an SSE body, got status {}", resp.status)
+        };
+        source.reactor_reg()
+    }
+
+    /// Printable, newline-free bytes, so a `text/plain` SSE frame carries them
+    /// on one `data:` line.
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    /// Seal, upload and compact until every sealed byte is only in the bucket
+    /// and the live file starts above `above`. Loops because an append may have
+    /// started a background pass that holds the stream's seal guard.
+    async fn seal_into_bucket(store: &Arc<Store>, st: &Arc<StreamState>, above: u64) -> u64 {
+        for _ in 0..200 {
+            store.maybe_seal(st).await;
+            let (sealed, all_remote) = {
+                let m = st.tier.manifest.lock().unwrap();
+                let all_remote = !m.segments.is_empty() && m.segments.iter().all(|s| s.remote);
+                (m.sealed_offset, all_remote && !m.offloading)
+            };
+            let file_base = st.shared.read().unwrap().file_base;
+            if file_base > above && all_remote && file_base == sealed {
+                return sealed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the stream's older bytes never moved into the bucket");
+    }
+
+    /// The text of every `data` event in an SSE frame, in order.
+    fn data_events(frame: &str) -> Vec<String> {
+        frame
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("event: data\n"))
+            .map(|event| {
+                event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect()
+    }
+
+    /// Read from `client` until the accumulated bytes contain `needle`.
+    fn read_until(client: &mut std::net::TcpStream, seen: &mut Vec<u8>, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(seen).contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "reactor never sent {needle:?}; got {:?}",
+                String::from_utf8_lossy(seen)
+            );
+            match client.read(&mut buf) {
+                Ok(0) => panic!(
+                    "reactor closed the subscriber before {needle:?}; got {:?}",
+                    String::from_utf8_lossy(seen)
+                ),
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("read from reactor subscriber: {e}"),
+            }
+        }
+    }
+
+    /// Hand a real socket to the reactor, as `engine_raw` does, and return the
+    /// client end.
+    async fn reactor_subscriber(resp: &Resp, reg: crate::api::SseReg) -> std::net::TcpStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        crate::http1::write_head(&mut head, resp.status, &resp.headers, None, true);
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        crate::sse_reactor::register(server, head, reg, permit);
+        client
+    }
+
+    /// Read from `client` until the reactor closes it.
+    fn read_to_close(client: &mut std::net::TcpStream) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "reactor never closed the subscriber; got {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+            match client.read(&mut buf) {
+                Ok(0) => return seen,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("read from reactor subscriber: {e}"),
+            }
+        }
+    }
+
+    /// The payloads of every `data` event in the raw (chunk-framed) bytes a
+    /// reactor subscriber received, in order.
+    fn reactor_data(seen: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(seen);
+        text.split("event: data\ndata:")
+            .skip(1)
+            .map(|rest| rest.split('\n').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sse_tail_reader_on_stream_with_no_s3_bytes_registers_with_reactor() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("fresh");
+        let store = tiered_store(&dir);
+        create(&store, "t/fresh").await;
+        append(&store, "t/fresh", &payload(100)).await;
+        let st = store.streams.get("t/fresh").unwrap().clone();
+        assert_eq!(st.tier.manifest.lock().unwrap().sealed_offset, 0);
+
+        let tail = st.tail().bytes;
+        let reg = reactor_reg(&sse(&store, "t/fresh", tail).await)
+            .expect("a tail reader must register with the reactor when a bucket is configured");
+        assert_eq!(reg.start, tail);
+        // Nothing is in S3, so a catch-up from the start is a live-file read too.
+        assert!(reactor_reg(&sse(&store, "t/fresh", 0).await).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sse_tail_reader_on_stream_with_s3_bytes_is_served_by_reactor() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("cold-tail");
+        let store = tiered_store(&dir);
+        create(&store, "t/cold").await;
+        append(&store, "t/cold", &payload(5000)).await;
+        let st = store.streams.get("t/cold").unwrap().clone();
+        let sealed = seal_into_bucket(&store, &st, 0).await;
+
+        // A reader starting at or after the sealed offset needs no S3 bytes.
+        assert!(reactor_reg(&sse(&store, "t/cold", sealed).await).is_some());
+        let tail = st.tail().bytes;
+        let resp = sse(&store, "t/cold", tail).await;
+        let reg = reactor_reg(&resp)
+            .expect("a tail reader on a stream with S3 bytes must register with the reactor");
+        assert_eq!(reg.start, tail);
+
+        // The subscriber receives the next append.
+        let mut client = reactor_subscriber(&resp, reg).await;
+        let mut seen = Vec::new();
+        read_until(&mut client, &mut seen, "\"upToDate\":true");
+        append(&store, "t/cold", b"NEXT-APPEND").await;
+        read_until(&mut client, &mut seen, "data:NEXT-APPEND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The idle pass seals and compacts under live readers. A caught-up reactor
+    /// subscriber keeps reading the swapped live file; a registration whose
+    /// start the cut overtook (the gate ran before the compaction, the reactor
+    /// inserted it after) gets only the terminating chunk, never wrong bytes.
+    /// A woken subscriber always reads up to the tail, so that race is the only
+    /// way one is left behind the cut.
+    #[tokio::test]
+    async fn sse_reactor_subscribers_across_a_compaction() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("compaction");
+        let store = tiered_store(&dir);
+        create(&store, "t/compact").await;
+        append(&store, "t/compact", &payload(5000)).await;
+        let st = store.streams.get("t/compact").unwrap().clone();
+        seal_into_bucket(&store, &st, 0).await;
+
+        let start = st.tail().bytes;
+        let resp = sse(&store, "t/compact", start).await;
+        let reg = reactor_reg(&resp).expect("a tail reader registers with the reactor");
+        let mut caught_up = reactor_subscriber(&resp, reg).await;
+        let mut seen = Vec::new();
+        read_until(&mut caught_up, &mut seen, "\"upToDate\":true");
+        // Passed the gate at the same offset, but not yet inserted.
+        let behind_resp = sse(&store, "t/compact", start).await;
+        let behind = reactor_reg(&behind_resp).expect("the gate admits it before the cut");
+
+        // Bytes the subscriber reads from the old live file.
+        let big = "B".repeat(3000);
+        append(&store, "t/compact", big.as_bytes()).await;
+        let after_big = st.tail().bytes;
+        read_until(
+            &mut caught_up,
+            &mut seen,
+            &format!("\"streamNextOffset\":\"{}\"", format_offset(after_big)),
+        );
+
+        // Seal and compact past both subscribers' start.
+        let old_file = st.shared.read().unwrap().file.clone();
+        let file_base = seal_into_bucket(&store, &st, start).await;
+        assert!(
+            file_base > start,
+            "the cut must overtake the registered start"
+        );
+        assert!(
+            !Arc::ptr_eq(&old_file, &st.shared.read().unwrap().file),
+            "compaction must have swapped the live file"
+        );
+
+        // The caught-up subscriber gets the next append from the new file.
+        append(&store, "t/compact", b"AFTER-COMPACTION").await;
+        read_until(&mut caught_up, &mut seen, "data:AFTER-COMPACTION\n");
+        assert_eq!(
+            reactor_data(&seen).concat(),
+            format!("{big}AFTER-COMPACTION"),
+            "the caught-up subscriber receives exactly the appended bytes"
+        );
+
+        // The overtaken registration is ended cleanly, with no data.
+        let mut lagging = reactor_subscriber(&behind_resp, behind).await;
+        let got = read_to_close(&mut lagging);
+        assert!(
+            reactor_data(&got).is_empty(),
+            "a subscriber behind the cut must get no bytes; got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert!(
+            got.ends_with(b"0\r\n\r\n"),
+            "a subscriber behind the cut gets the terminating chunk; got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sse_read_below_sealed_offset_stays_inline_and_returns_s3_bytes_first() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("cold-catch-up");
+        let store = tiered_store(&dir);
+        create(&store, "t/catch-up").await;
+        let bytes = payload(5000);
+        append(&store, "t/catch-up", &bytes).await;
+        let st = store.streams.get("t/catch-up").unwrap().clone();
+        let sealed = seal_into_bucket(&store, &st, 0).await;
+
+        assert!(
+            reactor_reg(&sse(&store, "t/catch-up", sealed - 1).await).is_none(),
+            "a read that starts in S3 bytes must not go to the reactor"
+        );
+        let resp = sse(&store, "t/catch-up", 0).await;
+        assert!(reactor_reg(&resp).is_none());
+        let Body::Sse(mut source) = resp.body else {
+            panic!("expected an SSE body")
+        };
+        let mut delivered = String::new();
+        for _ in 0..50 {
+            let chunk = source
+                .next_chunk()
+                .await
+                .expect("SSE must reach up-to-date");
+            let frame = String::from_utf8(chunk.to_vec()).unwrap();
+            for data in data_events(&frame) {
+                delivered.push_str(&data);
+            }
+            if frame.contains("\"upToDate\":true") {
+                break;
+            }
+        }
+        // The sealed prefix is only in the bucket (the live file starts at the
+        // sealed offset), so these first bytes came from S3.
+        let expected = String::from_utf8(bytes).unwrap();
+        assert_eq!(&delivered[..sealed as usize], &expected[..sealed as usize]);
+        assert_eq!(delivered, expected, "S3 bytes first, then the live tail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn long_poll_tail_reader_on_stream_with_s3_bytes_stays_on_hot_path() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("long-poll");
+        let store = tiered_store(&dir);
+        create(&store, "t/long-poll").await;
+        append(&store, "t/long-poll", &payload(5000)).await;
+        let st = store.streams.get("t/long-poll").unwrap().clone();
+        seal_into_bucket(&store, &st, 0).await;
+
+        let tail = st.tail().bytes;
+        let receivers = st.tail_tx.receiver_count();
+        let waiter = {
+            let store = Arc::clone(&store);
+            let query = Some(format!("live=long-poll&offset={}", format_offset(tail)));
+            tokio::spawn(
+                async move { handle(store, req(Method::Get, "t/long-poll", query, b"")).await },
+            )
+        };
+        // The handler subscribes to the tail only on its wait path, so a new
+        // receiver proves the request parked before the append.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.tail_tx.receiver_count() == receivers {
+            assert!(Instant::now() < deadline, "the long-poll never parked");
+            tokio::task::yield_now().await;
+        }
+        append(&store, "t/long-poll", b"NEXT-APPEND").await;
+        let resp = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the long-poll must wake on the next append")
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let got = match resp.body {
+            // The resident tail chunk, or the live file served zero-copy.
+            Body::Full(b) => b.to_vec(),
+            Body::FileRange { segments, .. } => {
+                crate::store::materialize_segments(&segments).to_vec()
+            }
+            _ => panic!("a tail long-poll must not take the cold streaming path"),
+        };
+        assert_eq!(got, b"NEXT-APPEND");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

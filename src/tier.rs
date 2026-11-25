@@ -861,20 +861,27 @@ impl Store {
             );
             return;
         };
-        let mut finished = 0usize;
-        for note in &notes {
-            match self.finish_tier_delete(bs, note).await {
-                Ok(()) => finished += 1,
-                Err(e) => eprintln!(
-                    "WARN: pending tier delete {} kept for the next start: {e}",
+        // Stop at the first failure: an unreachable bucket fails every note,
+        // each only after the client's whole retry budget, and the store is not
+        // serving yet. The failed note and the rest stay for the next start.
+        let total = notes.len();
+        for (i, note) in notes.iter().enumerate() {
+            if let Err(e) = self.finish_tier_delete(bs, note).await {
+                eprintln!(
+                    "recovery: pending tier delete {}/{total} kept for the next start ({e}), with the {} after it: {}",
+                    i + 1,
+                    total - i - 1,
                     note.display()
-                ),
+                );
+                return;
             }
+            eprintln!(
+                "recovery: pending tier delete {}/{total} finished: {}",
+                i + 1,
+                note.display()
+            );
         }
-        eprintln!(
-            "recovery: finished {finished} of {} pending tier delete(s)",
-            notes.len()
-        );
+        eprintln!("recovery: finished {total} pending tier delete(s)");
     }
 
     async fn finish_tier_delete(
@@ -936,6 +943,12 @@ impl Store {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
+            // A pass still in flight may yet land an upload after the deletes
+            // below; keep the note so the next start deletes it again.
+            let upload_in_flight = st.tier.manifest.lock().unwrap().offloading;
+            if upload_in_flight && note.is_some() {
+                tracing::warn!(stream = %st.path, "tier upload still in flight at delete; its pending-delete note is kept for the next start");
+            }
             // Snapshot the final segment set. Delete EVERY segment's remote object
             // by its deterministic key — this covers an object that was uploaded
             // just before a pass bailed but not yet flipped to `Remote` (a plain
@@ -959,7 +972,7 @@ impl Store {
                 (keys, local)
             };
             // Remote deletes (only when a blobstore is configured)…
-            let mut all_deleted = true;
+            let mut all_deleted = !upload_in_flight;
             if let Some(bs) = bs {
                 for k in keys {
                     if let Err(e) = bs.delete(&k).await {

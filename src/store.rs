@@ -4434,6 +4434,108 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// GC's wait for an in-flight seal/offload pass is bounded. When the pass
+    /// outlasts it, an upload may still land after the deletes, so the note
+    /// must survive for the next start to delete it again.
+    #[tokio::test]
+    async fn tier_delete_note_survives_an_upload_still_in_flight() {
+        let dir = tmp_dir("note-upload-in-flight");
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let (st, _) = offloaded_stream(&store, "s/inflight", octet_cfg()).await;
+        let file_name = file_name_of(&st);
+        let note = crate::tier::tier_delete_note_path(&st.file_path);
+        // A pass that never finishes within GC's wait.
+        st.tier.manifest.lock().unwrap().offloading = true;
+        store.delete_or_soft_delete(&st);
+
+        let mut waited = 0;
+        while objects_of(&dir, &file_name) > 0 && waited < 600 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(objects_of(&dir, &file_name), 0, "GC did not run");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(note.exists(), "note cleared while an upload was in flight");
+        drop(st);
+        drop(store);
+
+        let store2 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        store2.finish_pending_tier_deletes().await;
+        assert!(!note.exists(), "the next start did not finish the note");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blobstore whose every call fails, as an unreachable bucket does;
+    /// counts the deletes it is asked for.
+    struct UnreachableBlobStore(std::sync::atomic::AtomicUsize);
+
+    impl crate::blobstore::BlobStore for UnreachableBlobStore {
+        fn put<'a>(
+            &'a self,
+            _key: &'a str,
+            _body: bytes::Bytes,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            Box::pin(async { Err(std::io::Error::other("bucket unreachable")) })
+        }
+        fn get_range<'a>(
+            &'a self,
+            _key: &'a str,
+            _start: u64,
+            _len: u64,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+            Box::pin(async { Err(std::io::Error::other("bucket unreachable")) })
+        }
+        fn head<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
+            Box::pin(async { Err(std::io::Error::other("bucket unreachable")) })
+        }
+        fn delete<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(std::io::Error::other("bucket unreachable")) })
+        }
+    }
+
+    /// With the bucket unreachable, startup gives up at the first failed
+    /// delete instead of paying the client's retry budget once per note, and
+    /// keeps every note for the next start.
+    #[tokio::test]
+    async fn startup_stops_at_the_first_failed_tier_delete_and_keeps_every_note() {
+        let dir = tmp_dir("note-unreachable");
+        let notes = {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            let mut notes = Vec::new();
+            for path in ["s/one", "s/two"] {
+                let (st, _) = offloaded_stream(&store, path, octet_cfg()).await;
+                assert!(store.record_tier_delete(&st).unwrap());
+                notes.push(crate::tier::tier_delete_note_path(&st.file_path));
+            }
+            notes
+        };
+
+        let mut store2 = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
+        let unreachable = Arc::new(UnreachableBlobStore(std::sync::atomic::AtomicUsize::new(0)));
+        let shared: crate::blobstore::SharedBlobStore = unreachable.clone();
+        store2.blobstore = Some(shared);
+        store2.finish_pending_tier_deletes().await;
+        assert_eq!(
+            unreachable.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "startup kept deleting after the bucket failed"
+        );
+        for note in &notes {
+            assert!(note.exists(), "note {} lost", note.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaper's retirement of an expired stream with bytes in the remote
     /// tier removes its local state and its objects and leaves no note.
     #[tokio::test]

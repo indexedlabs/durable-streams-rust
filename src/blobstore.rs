@@ -153,7 +153,7 @@ pub use s3::S3BlobStore;
 #[cfg(feature = "tier")]
 mod s3 {
     use super::*;
-    use object_store::aws::AmazonS3Builder;
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
     use object_store::path::Path as ObjPath;
     use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -195,6 +195,20 @@ mod s3 {
             b = b
                 .with_access_key_id(k.clone())
                 .with_secret_access_key(s.clone());
+        } else {
+            // No static keys: use the host's role. `object_store` reads an EKS web
+            // identity from the environment itself, but takes an ECS task role's
+            // endpoint and the instance-metadata endpoint only when handed them;
+            // without them it asks EC2 instance metadata, which Fargate does not
+            // serve and which on EC2 is the instance's role, not the task's.
+            for key in [
+                AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+                AmazonS3ConfigKey::MetadataEndpoint,
+            ] {
+                if let Ok(v) = std::env::var(key.as_ref().to_ascii_uppercase()) {
+                    b = b.with_config(key, v);
+                }
+            }
         }
         Ok(b)
     }

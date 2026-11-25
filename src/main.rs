@@ -415,6 +415,9 @@ fn main() {
             "--tier-allow-http" => {
                 tier.allow_http = true;
             }
+            "--tier-after-idle-secs" => {
+                tier.after_idle_secs = Some(parse_val(args.next(), "--tier-after-idle-secs"));
+            }
             "--allow-non-loopback-host" => {
                 allow_non_loopback_host = true;
             }
@@ -550,6 +553,10 @@ fn main() {
         max_open_stream_files
             .unwrap_or_else(|| stream_file::default_max_open(stream_file::process_fds().1)),
     );
+
+    if tier.after_idle_secs.is_some() && tier.kind != tier::TierKind::S3 {
+        exit_usage("--tier-after-idle-secs requires --tier s3");
+    }
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
     // append path with the WAL stage/wait skipped (no splice intercept, no forced

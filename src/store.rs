@@ -46,6 +46,54 @@ pub struct StreamConfig {
     pub forked_from: Option<String>,
     pub fork_offset_raw: Option<String>,
     pub fork_sub_offset: Option<u64>,
+    /// The stream's own idle time for the tier (`Stream-Tier-After-Idle`);
+    /// `None` takes the store's `--tier-after-idle-secs`. Not part of the
+    /// stream's shape: an idempotent create never compares it.
+    pub tier_after_idle: Option<TierAfterIdle>,
+}
+
+/// How long a stream may go unwritten before the tier moves its local bytes.
+/// In the sidecar it is a number of seconds or the string `"never"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierAfterIdle {
+    Secs(u64),
+    Never,
+}
+
+impl std::fmt::Display for TierAfterIdle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TierAfterIdle::Secs(secs) => write!(f, "{secs}"),
+            TierAfterIdle::Never => f.write_str("never"),
+        }
+    }
+}
+
+impl serde::Serialize for TierAfterIdle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TierAfterIdle::Secs(secs) => serializer.serialize_u64(*secs),
+            TierAfterIdle::Never => serializer.serialize_str("never"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TierAfterIdle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Secs(u64),
+            Word(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Secs(secs) => Ok(TierAfterIdle::Secs(secs)),
+            Raw::Word(word) if word == "never" => Ok(TierAfterIdle::Never),
+            Raw::Word(word) => Err(serde::de::Error::custom(format!(
+                "tier_after_idle must be seconds or \"never\", got {word:?}"
+            ))),
+        }
+    }
 }
 
 pub struct Shared {
@@ -1693,6 +1741,7 @@ impl Store {
                 forked_from: meta.forked_from.clone(),
                 fork_offset_raw: meta.fork_offset_raw.clone(),
                 fork_sub_offset: meta.fork_sub_offset,
+                tier_after_idle: meta.tier_after_idle,
             },
         });
         // Re-enqueue any sealed-but-not-yet-offloaded segments left by a crash
@@ -2780,6 +2829,8 @@ fn config_matches_with_closed(
         && ex.forked_from == requested.forked_from
         && ex.fork_offset_raw == requested.fork_offset_raw
         && ex.fork_sub_offset.unwrap_or(0) == requested.fork_sub_offset.unwrap_or(0)
+        // `tier_after_idle` is deliberately absent: a create that meets an
+        // existing stream never conflicts over it and leaves it as it is.
         // PUT without Stream-Closed against a closed stream is a conflict.
         && (requested.create_closed == closed_now)
 }
@@ -2942,6 +2993,11 @@ pub struct Meta {
     /// recovery falls back to trusting the file size (the pre-field behavior).
     #[serde(default)]
     pub durable_tail: Option<u64>,
+    /// The stream's own idle time for the tier. `None` (the stream takes the
+    /// store's default) is left out of the file, so a sidecar written before
+    /// the field reads as `None` and no sidecar grows it without a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_after_idle: Option<TierAfterIdle>,
 }
 
 /// Serialized form of a sealed-segment manifest entry.
@@ -3023,6 +3079,7 @@ impl Meta {
             file_base: Some(s.file_base),
             pending_compaction: *st.compaction.lock().unwrap(),
             durable_tail: Some(s.durable_tail),
+            tier_after_idle: st.config.tier_after_idle,
         }
     }
 }
@@ -3362,6 +3419,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/cold", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -3427,6 +3485,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/compact", scfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -3504,6 +3563,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/nothresh", scfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -3537,6 +3597,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 
@@ -3905,6 +3966,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/sl", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -3961,6 +4023,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/json", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -4022,6 +4085,7 @@ mod tier_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         };
         let st = match store.create("s/conc", cfg, None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -4069,6 +4133,7 @@ mod tier_tests {
                 forked_from: None,
                 fork_offset_raw: None,
                 fork_sub_offset: None,
+                tier_after_idle: None,
             };
             let st = match store.create("s/rec", cfg, None, 0).unwrap() {
                 CreateResult::Created(s) => s,
@@ -4616,6 +4681,7 @@ mod meta_sweep_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 
@@ -4777,6 +4843,7 @@ mod expiration_reaper_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
         }
     }
 
@@ -6256,6 +6323,7 @@ mod recovery_scale_tests {
             forked_from: None,
             fork_offset_raw: None,
             fork_sub_offset: None,
+            tier_after_idle: None,
             base_offset: 0,
             closed: false,
             closed_by: None,
@@ -6332,5 +6400,70 @@ mod recovery_scale_tests {
         }
         assert!(parked.exists(), "quarantined data file was deleted");
         assert_eq!(store.quarantined_stream_ids(), vec![parked_id]);
+    }
+}
+
+#[cfg(test)]
+mod tier_after_idle_sidecar_tests {
+    use super::*;
+
+    /// A sidecar as a server from before the idle time wrote it.
+    fn old_sidecar() -> serde_json::Value {
+        serde_json::json!({
+            "id": 7,
+            "path": "idle/old",
+            "content_type": "application/octet-stream",
+            "ttl_seconds": null,
+            "expires_at_unix": null,
+            "expires_at_raw": null,
+            "create_closed": false,
+            "forked_from": null,
+            "fork_offset_raw": null,
+            "fork_sub_offset": null,
+            "base_offset": 0,
+            "closed": false,
+            "closed_by": null,
+            "producers": {},
+            "last_seq_header": null,
+            "last_access_unix": 0,
+            "ref_count": 0,
+            "soft_deleted": false
+        })
+    }
+
+    #[test]
+    fn a_sidecar_without_the_idle_time_reads_as_absent_and_is_written_back_unchanged() {
+        let meta: Meta = serde_json::from_value(old_sidecar()).unwrap();
+        assert_eq!(meta.tier_after_idle, None);
+        let written = serde_json::to_value(&meta).unwrap();
+        assert!(
+            written.get("tier_after_idle").is_none(),
+            "a stream that takes the default must not grow the field: {written}"
+        );
+    }
+
+    #[test]
+    fn the_idle_time_is_seconds_or_never_in_the_sidecar() {
+        for (raw, expected) in [
+            (serde_json::json!(600), TierAfterIdle::Secs(600)),
+            (serde_json::json!(0), TierAfterIdle::Secs(0)),
+            (serde_json::json!("never"), TierAfterIdle::Never),
+        ] {
+            let mut sidecar = old_sidecar();
+            sidecar["tier_after_idle"] = raw.clone();
+            let meta: Meta = serde_json::from_value(sidecar).unwrap();
+            assert_eq!(meta.tier_after_idle, Some(expected), "{raw}");
+            assert_eq!(serde_json::to_value(&meta).unwrap()["tier_after_idle"], raw);
+        }
+        for bad in [
+            serde_json::json!("600"),
+            serde_json::json!("Never"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut sidecar = old_sidecar();
+            sidecar["tier_after_idle"] = bad.clone();
+            assert!(serde_json::from_value::<Meta>(sidecar).is_err(), "{bad}");
+        }
     }
 }

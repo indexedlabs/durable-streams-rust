@@ -1135,3 +1135,118 @@ fn wal_binds_a_non_loopback_host_when_explicitly_allowed() {
     );
     let _ = server.port();
 }
+
+/// `--tier s3` against an S3 endpoint nothing listens on: building the client
+/// contacts nothing, so startup gets past it.
+const TIER_S3: [&str; 9] = [
+    "--tier",
+    "s3",
+    "--tier-bucket",
+    "ds-idle-test",
+    "--tier-region",
+    "us-east-1",
+    "--tier-endpoint",
+    "http://127.0.0.1:9",
+    "--tier-allow-http",
+];
+
+/// Spawn with `args` and wait up to five seconds: the exit code (`None` = still
+/// running, then killed) and everything it wrote to stderr.
+fn startup_outcome(args: &[String]) -> (Option<i32>, String) {
+    let mut child = server()
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let code = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status.code().unwrap_or(-1)),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let out = child.wait_with_output().expect("collect output");
+    (code, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+#[test]
+fn tier_after_idle_secs_is_refused_without_tier_s3() {
+    for tier in [&[][..], &["--tier", "off"][..]] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args: Vec<String> = [
+            "--durability",
+            "memory",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--port",
+            &unused_local_port().to_string(),
+        ]
+        .map(str::to_string)
+        .to_vec();
+        args.extend(tier.iter().map(|value| value.to_string()));
+        args.extend(["--tier-after-idle-secs", "604800"].map(str::to_string));
+        let (code, stderr) = startup_outcome(&args);
+        assert_eq!(code, Some(2), "{tier:?}: {stderr}");
+        assert!(
+            stderr.contains("--tier-after-idle-secs requires --tier s3"),
+            "{tier:?}: the refusal must name the flag it needs, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn tier_after_idle_secs_rejects_a_value_that_is_not_seconds() {
+    for value in ["7d", "-1", "never"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args: Vec<String> = ["--data-dir", dir.path().to_str().unwrap()]
+            .map(str::to_string)
+            .to_vec();
+        args.extend(TIER_S3.map(str::to_string));
+        args.extend(["--tier-after-idle-secs", value].map(str::to_string));
+        let (code, stderr) = startup_outcome(&args);
+        assert_eq!(code, Some(2), "{value}: {stderr}");
+        assert!(
+            stderr.contains("--tier-after-idle-secs got an invalid value"),
+            "{value}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn tier_after_idle_secs_is_accepted_with_tier_s3() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-guard-tier-after-idle");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let mut extra = TIER_S3.to_vec();
+    extra.extend(["--tier-after-idle-secs", "604800"]);
+
+    if cfg!(feature = "tier") {
+        let server = ServerUnderTest::wal(&dir, &extra);
+        let response = server
+            .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        // 503 when the test filesystem is under the reserve floor; either
+        // proves startup accepted the flags and the server is serving.
+        assert!(
+            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
+            "--tier s3 --tier-after-idle-secs must start, got: {response}"
+        );
+    } else {
+        // A build without the `tier` feature cannot run `--tier s3` at all; it
+        // must get past the idle-time guard and stop on the missing feature.
+        let _guard = FixtureDir(dir.clone());
+        let mut args = wal_args(&dir, &unused_local_port().to_string());
+        args.extend(extra.iter().map(|value| value.to_string()));
+        let (code, stderr) = startup_outcome(&args);
+        assert!(code.is_some_and(|code| code != 0), "{code:?}: {stderr}");
+        assert!(
+            !stderr.contains("--tier-after-idle-secs"),
+            "the idle-time guard must accept --tier s3, got: {stderr}"
+        );
+        assert!(stderr.contains("--features tier"), "{stderr}");
+    }
+}

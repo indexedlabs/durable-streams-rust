@@ -4205,6 +4205,230 @@ mod tier_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- pending tier deletes: recorded before made, finished at startup ----
+
+    fn files_under(root: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    names.extend(files_under(&p));
+                } else if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// Objects in the local remote tier (`<data_dir>/cold`) that belong to the
+    /// stream incarnation whose data file is named `file_name`.
+    fn objects_of(dir: &std::path::Path, file_name: &str) -> usize {
+        files_under(&dir.join("cold"))
+            .iter()
+            .filter(|n| n.starts_with(file_name))
+            .count()
+    }
+
+    fn file_name_of(st: &Arc<StreamState>) -> String {
+        st.file_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Create `path` and seal + offload more than two segments of it.
+    async fn offloaded_stream(
+        store: &Arc<Store>,
+        path: &str,
+        cfg: StreamConfig,
+    ) -> (Arc<StreamState>, Vec<u8>) {
+        let st = match store.create(path, cfg, None, 0).unwrap() {
+            CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        store.maybe_seal(&st).await;
+        {
+            let m = st.tier.manifest.lock().unwrap();
+            assert!(m.segments.len() >= 2, "expected several sealed segments");
+            assert!(
+                m.segments.iter().all(|s| s.remote),
+                "expected all offloaded"
+            );
+        }
+        (st, payload)
+    }
+
+    /// Crash with the pending-delete note durable, at one of three points of
+    /// the delete: before anything else ran (`unlink_local == false`), after
+    /// the local state was unlinked with `objects_left` objects not yet
+    /// deleted. Restart must finish the delete: no local state, no objects,
+    /// no note.
+    async fn restart_after_tier_delete_note(tag: &str, unlink_local: bool, objects_left: usize) {
+        let dir = tmp_dir(tag);
+        let (file_path, file_name, note, objects) = {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            let (st, _) = offloaded_stream(&store, "s/note", octet_cfg()).await;
+            let file_name = file_name_of(&st);
+            let objects = objects_of(&dir, &file_name);
+            assert!(objects >= 2, "expected offloaded objects ({tag})");
+            assert!(
+                store.record_tier_delete(&st).unwrap(),
+                "a stream with objects records its delete ({tag})"
+            );
+            let note = crate::tier::tier_delete_note_path(&st.file_path);
+            assert!(
+                note.exists(),
+                "the note is on disk before any delete ({tag})"
+            );
+            (st.file_path.clone(), file_name, note, objects)
+        };
+        if unlink_local {
+            std::fs::remove_file(meta_path(&file_path)).unwrap();
+            std::fs::remove_file(&file_path).unwrap();
+            let mut deleted = 0;
+            for name in files_under(&dir.join("cold")) {
+                if deleted + objects_left == objects {
+                    break;
+                }
+                std::fs::remove_file(dir.join("cold").join(name)).unwrap();
+                deleted += 1;
+            }
+            assert_eq!(objects_of(&dir, &file_name), objects_left);
+        } else {
+            assert!(file_path.exists() && meta_path(&file_path).exists());
+        }
+
+        let store2 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        assert!(
+            store2.get("s/note").is_none(),
+            "a stream with a pending delete is not recovered ({tag})"
+        );
+        store2.finish_pending_tier_deletes().await;
+        assert_eq!(objects_of(&dir, &file_name), 0, "objects left ({tag})");
+        assert!(!file_path.exists(), "data file left ({tag})");
+        assert!(!meta_path(&file_path).exists(), "sidecar left ({tag})");
+        assert!(!note.exists(), "note not cleared ({tag})");
+        assert!(
+            files_under(&dir.join("segments")).is_empty(),
+            "chunk files left ({tag})"
+        );
+        drop(store2);
+
+        // Nothing is left to finish on the next start either.
+        let store3 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        assert!(store3.get("s/note").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_between_tier_delete_note_and_object_delete_finishes_it() {
+        restart_after_tier_delete_note("note-before-delete", false, usize::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn restart_part_way_through_object_deletes_finishes_them() {
+        restart_after_tier_delete_note("note-part-way", true, 1).await;
+    }
+
+    #[tokio::test]
+    async fn restart_after_object_deletes_before_note_cleared_clears_it() {
+        restart_after_tier_delete_note("note-after-delete", true, 0).await;
+    }
+
+    /// A stream recreated at the path of a stream whose delete is still
+    /// pending keeps its own objects: the note names the old incarnation only.
+    #[tokio::test]
+    async fn pending_tier_delete_spares_a_stream_recreated_at_the_same_path() {
+        let dir = tmp_dir("note-recreate");
+        let old_name = {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            let (st, _) = offloaded_stream(&store, "s/again", octet_cfg()).await;
+            assert!(store.record_tier_delete(&st).unwrap());
+            file_name_of(&st)
+        };
+        assert!(objects_of(&dir, &old_name) >= 2);
+
+        // Recreate before the pending delete is finished: the strongest order.
+        let store2 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let (st, payload) = offloaded_stream(&store2, "s/again", octet_cfg()).await;
+        let new_name = file_name_of(&st);
+        assert_ne!(new_name, old_name, "a new incarnation gets a new data file");
+        let new_objects = objects_of(&dir, &new_name);
+        assert!(new_objects >= 2);
+
+        store2.finish_pending_tier_deletes().await;
+        assert_eq!(objects_of(&dir, &old_name), 0, "old objects left");
+        assert_eq!(objects_of(&dir, &new_name), new_objects, "new objects lost");
+        let got = read_logical(&st, 0, payload.len() as u64).await;
+        assert_eq!(got, payload, "recreated stream reads back exact");
+        drop(st);
+        drop(store2);
+
+        let store3 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let st = store3.get("s/again").expect("recreated stream recovered");
+        let got = read_logical(&st, 0, payload.len() as u64).await;
+        assert_eq!(got, payload, "recreated stream survives a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reaper's retirement of an expired stream with bytes in the remote
+    /// tier removes its local state and its objects and leaves no note.
+    #[tokio::test]
+    async fn expired_tiered_stream_retires_with_its_objects() {
+        let dir = tmp_dir("expire-tiered");
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(1);
+        let (st, _) = offloaded_stream(&store, "s/expires", cfg).await;
+        let file_name = file_name_of(&st);
+        let file_path = st.file_path.clone();
+        let note = crate::tier::tier_delete_note_path(&file_path);
+        assert!(objects_of(&dir, &file_name) >= 2);
+        drop(st);
+
+        let later = SystemTime::now() + std::time::Duration::from_secs(10);
+        let candidate = match store.lookup_at("s/expires", later, false) {
+            StreamLookup::Expired(candidate) => candidate,
+            _ => panic!("stream did not expire"),
+        };
+        assert_eq!(
+            store.prepare_expiry_retirement(&candidate, later).await,
+            PrepareRetirement::Ready
+        );
+        let step = store
+            .finish_retirement(&candidate, RetirementDurability::Expiry)
+            .await
+            .unwrap();
+        assert_eq!(step.outcome, RetirementOutcome::Reaped);
+        assert!(!file_path.exists() && !meta_path(&file_path).exists());
+
+        let mut waited = 0;
+        while (objects_of(&dir, &file_name) > 0 || note.exists()) && waited < 300 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(objects_of(&dir, &file_name), 0, "objects left after expiry");
+        assert!(!note.exists(), "note left after the delete finished");
+        assert!(files_under(&dir.join("segments")).is_empty());
+        assert!(store.get("s/expires").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------- batched meta sweep tests (#4691) ----------------

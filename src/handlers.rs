@@ -3404,6 +3404,89 @@ mod admin_inventory_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn unstable_listing_omits_soft_deleted_fork_parents_on_every_page() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir =
+            std::env::temp_dir().join(format!("ds-inventory-tombstone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for path in ["p.0-dead", "p.a", "p.parent", "p.z"] {
+            assert_eq!(write(&store, Method::Put, path, b"").await, 201, "{path}");
+        }
+        // Each parent keeps a child, so deleting it leaves a tombstone.
+        for (child, parent) in [("q.child0", "p.0-dead"), ("q.child1", "p.parent")] {
+            let forked = handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Put,
+                    path: child.into(),
+                    query: None,
+                    headers: vec![
+                        ("content-type".into(), "application/octet-stream".into()),
+                        ("stream-forked-from".into(), parent.into()),
+                        ("stream-fork-offset".into(), "now".into()),
+                    ],
+                    body: bytes::Bytes::new(),
+                },
+            )
+            .await;
+            assert_eq!(forked.status, 201, "{child}");
+        }
+        assert_eq!(write(&store, Method::Delete, "p.0-dead", b"").await, 204);
+        let paths = |page: &serde_json::Value| -> Vec<String> {
+            page["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (status, first) = inventory_json(&store, "prefix=p.&stable=false&limit=1");
+        assert_eq!(status, 200);
+        assert_eq!(
+            paths(&first),
+            ["p.a"],
+            "a tombstone from before the listing is omitted"
+        );
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+        assert_eq!(write(&store, Method::Delete, "p.parent", b"").await, 204);
+        let (_, stable) = inventory_json(&store, "prefix=p.");
+        let parent = &stable["streams"].as_array().unwrap()[2];
+        assert_eq!(parent["path"], "p.parent");
+        assert_eq!(parent["deleted"], true, "the parent is kept as a tombstone");
+        assert_eq!(stable["streams"][0]["path"], "p.0-dead");
+        assert_eq!(
+            stable["streams"][0]["deleted"], true,
+            "the stable listing still shows tombstones"
+        );
+
+        let mut listed = paths(&first);
+        let mut query = format!("prefix=p.&stable=false&limit=1&cursor={cursor}");
+        loop {
+            let (status, page) = inventory_json(&store, &query);
+            assert_eq!(status, 200);
+            assert!(page["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["deleted"] == false));
+            listed.extend(paths(&page));
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            query = format!("prefix=p.&stable=false&limit=1&cursor={cursor}");
+        }
+        assert_eq!(
+            listed,
+            ["p.a", "p.z"],
+            "the continuation omits the new tombstone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn inventory_prefix_filters_the_fenced_listing_and_rejects_bad_parameters() {
         let dir = std::env::temp_dir().join(format!("ds-inventory-prefix-{}", std::process::id()));

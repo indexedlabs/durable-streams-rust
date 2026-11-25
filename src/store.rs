@@ -48,7 +48,9 @@ pub struct StreamConfig {
     pub fork_sub_offset: Option<u64>,
     /// The stream's own idle time for the tier (`Stream-Tier-After-Idle`);
     /// `None` takes the store's `--tier-after-idle-secs`. Not part of the
-    /// stream's shape: an idempotent create never compares it.
+    /// stream's shape: an idempotent create never compares it. This is the value
+    /// the stream was created or recovered with; `PATCH` changes the current one,
+    /// `Shared::tier_after_idle`.
     pub tier_after_idle: Option<TierAfterIdle>,
 }
 
@@ -145,6 +147,10 @@ pub struct Shared {
     pub ref_count: u32,
     /// Deleted while forks still reference it: direct ops 410, path blocked.
     pub soft_deleted: bool,
+    /// The stream's own idle time now: `StreamConfig::tier_after_idle` until a
+    /// `PATCH` changes it (`set_tier_after_idle_sync`). Never ahead of the
+    /// durable sidecar.
+    pub tier_after_idle: Option<TierAfterIdle>,
 }
 
 pub struct Appender {
@@ -1685,6 +1691,7 @@ impl Store {
                 last_access: UNIX_EPOCH + Duration::from_secs(meta.last_access_unix),
                 ref_count: meta.ref_count,
                 soft_deleted: meta.soft_deleted,
+                tier_after_idle: meta.tier_after_idle,
             }),
             tail_tx,
             fenced: AtomicBool::new(meta.soft_deleted),
@@ -2464,6 +2471,7 @@ impl Store {
                 last_access: SystemTime::now(),
                 ref_count: 0,
                 soft_deleted: false,
+                tier_after_idle: config.tier_after_idle,
             }),
             tail_tx,
             fenced: AtomicBool::new(false),
@@ -3058,7 +3066,7 @@ impl Meta {
             file_base: Some(s.file_base),
             pending_compaction: *st.compaction.lock().unwrap(),
             durable_tail: Some(s.durable_tail),
-            tier_after_idle: st.config.tier_after_idle,
+            tier_after_idle: s.tier_after_idle,
         }
     }
 }
@@ -3111,28 +3119,54 @@ fn write_meta_sync_locked(
 /// which makes the read/modify/rename atomic with respect to every full sidecar
 /// writer and the retirement unlink decision.
 fn write_ref_count_meta_sync_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
+    let mut meta = read_meta_sync_locked(st, "fork refcount")?;
+    meta.ref_count = st.shared.read().unwrap().ref_count;
+    write_meta_value_sync_locked(st, &meta, durable)
+}
+
+/// Change the stream's own idle time, durable before it is visible. `Ok(false)`
+/// means retirement fenced the stream first and nothing was written. Merged into
+/// the last durable sidecar as the fork refcount is, so it persists no
+/// unacknowledged append or close and no `last_access` the stream has not
+/// flushed.
+pub fn set_tier_after_idle_sync(
+    st: &StreamState,
+    tier_after_idle: Option<TierAfterIdle>,
+) -> std::io::Result<bool> {
+    // Held through the in-memory change: a full sidecar writer captures either
+    // before the merge or after the new value is in `Shared`.
+    let _g = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if st.fenced.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let mut meta = read_meta_sync_locked(st, "idle time")?;
+    meta.tier_after_idle = tier_after_idle;
+    write_meta_value_sync_locked(st, &meta, true)?;
+    st.shared.write().unwrap().tier_after_idle = tier_after_idle;
+    Ok(true)
+}
+
+/// The stream's last written sidecar, for a caller that holds `st.meta_lock` and
+/// is about to replace one `field` of it.
+fn read_meta_sync_locked(st: &StreamState, field: &str) -> std::io::Result<Meta> {
     let final_path = meta_path(&st.file_path);
     let bytes = std::fs::read(&final_path)?;
-    let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|error| {
+    let meta: Meta = serde_json::from_slice(&bytes).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "cannot update fork refcount in {}: {error}",
-                final_path.display()
-            ),
+            format!("cannot update {field} in {}: {error}", final_path.display()),
         )
     })?;
     if meta.id != st.id || meta.path != st.path {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "cannot update fork refcount in {}: sidecar identity does not match stream",
+                "cannot update {field} in {}: sidecar identity does not match stream",
                 final_path.display()
             ),
         ));
     }
-    meta.ref_count = st.shared.read().unwrap().ref_count;
-    write_meta_value_sync_locked(st, &meta, durable)
+    Ok(meta)
 }
 
 /// Serialize an already-selected metadata snapshot while the caller holds

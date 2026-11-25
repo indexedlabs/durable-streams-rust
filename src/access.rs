@@ -399,7 +399,7 @@ impl Capacity {
             .identities
             .get(&authorization.identity)
             .ok_or_else(|| PolicyError("authorized identity has no capacity profile".into()))?;
-        let is_write = matches!(method, "PUT" | "POST" | "DELETE");
+        let is_write = matches!(method, "PUT" | "POST" | "PATCH" | "DELETE");
         if is_write && content_length.is_none() {
             return Err(PolicyError(
                 "writes require a canonical Content-Length".into(),
@@ -1510,6 +1510,29 @@ mod tests {
     }
 
     #[test]
+    fn patch_counts_against_the_append_budget() {
+        let policy = policy();
+        let capacity = Capacity::new(&policy);
+        let writer = Authorization {
+            identity: "agent-writer-dev".into(),
+            admin: false,
+        };
+        for _ in 0..100 {
+            drop(capacity.reserve(&writer, "PATCH", Some(0)).unwrap());
+        }
+        assert!(capacity
+            .reserve(&writer, "PATCH", Some(0))
+            .unwrap_err()
+            .0
+            .contains("rate"));
+        assert!(capacity
+            .reserve(&writer, "POST", Some(1))
+            .unwrap_err()
+            .0
+            .contains("rate"));
+    }
+
+    #[test]
     fn every_write_requires_a_canonical_content_length() {
         let policy = policy();
         let capacity = Capacity::new(&policy);
@@ -1527,6 +1550,12 @@ mod tests {
             "chunked writes must not bypass the global body limit"
         );
         assert!(capacity.reserve(&circuits, "POST", Some(0)).is_ok());
+        assert!(capacity
+            .reserve(&circuits, "PATCH", None)
+            .unwrap_err()
+            .0
+            .contains("Content-Length"));
+        assert!(capacity.reserve(&circuits, "PATCH", Some(0)).is_ok());
     }
 
     #[test]

@@ -3370,7 +3370,7 @@ mod admin_inventory_tests {
             for created in [
                 format!("a.0-{round}"),
                 format!("a.9-{round}"),
-                format!("b.{round}"),
+                format!("b.new-{round}"),
             ] {
                 assert_eq!(write(&store, Method::Put, &created, b"").await, 201);
             }

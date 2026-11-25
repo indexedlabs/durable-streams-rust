@@ -4672,6 +4672,197 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A soft-deleted fork parent is recovered fenced. Its sealed-but-local
+    /// segment must stay local across restarts: uploading it would flip it to
+    /// Remote with a sidecar write the fence skips, and unlinking the chunk
+    /// would leave the fork's inherited bytes unreadable after the next start.
+    #[tokio::test]
+    async fn fenced_fork_parent_keeps_its_local_segment_across_restarts() {
+        let dir = tmp_dir("fenced-parent-local");
+        let total = 200 * 1024usize;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let parent_name = {
+            // Uploads fail, so the first sealed segment stays Local.
+            let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
+            let unreachable: crate::blobstore::SharedBlobStore =
+                Arc::new(UnreachableBlobStore(std::sync::atomic::AtomicUsize::new(0)));
+            store.blobstore = Some(unreachable);
+            let store = Arc::new(store);
+            let parent = match store.create("s/parent", octet_cfg(), None, 0).unwrap() {
+                CreateResult::Created(s) => s,
+                _ => panic!("create failed"),
+            };
+            for chunk in payload.chunks(8 * 1024) {
+                append_wire(&parent, chunk).await;
+            }
+            store.maybe_seal(&parent).await;
+            {
+                let m = parent.tier.manifest.lock().unwrap();
+                assert_eq!(m.segments.len(), 1);
+                assert!(!m.segments[0].remote, "the segment should still be local");
+            }
+            let mut fork_cfg = octet_cfg();
+            fork_cfg.forked_from = Some("s/parent".into());
+            fork_cfg.fork_offset_raw = Some(total.to_string());
+            match store
+                .create("s/child", fork_cfg, Some(Arc::clone(&parent)), total as u64)
+                .unwrap()
+            {
+                CreateResult::Created(_) => {}
+                _ => panic!("fork create failed"),
+            }
+            assert_eq!(
+                store.prepare_delete(&parent).await,
+                PrepareRetirement::Ready
+            );
+            let step = store
+                .finish_retirement(
+                    &store.candidate_for(&parent),
+                    RetirementDurability::Explicit,
+                )
+                .await
+                .unwrap();
+            assert_eq!(step.outcome, RetirementOutcome::SoftDeleted);
+            file_name_of(&parent)
+        };
+
+        // First restart: the remote tier is reachable, and boot reconcile runs
+        // for the parent's local segment.
+        {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                objects_of(&dir, &parent_name),
+                0,
+                "a fenced parent's segment was uploaded"
+            );
+            drop(store);
+        }
+
+        // Second restart: the fork still reads its inherited bytes.
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let child = store.get("s/child").expect("fork recovered");
+        let got = read_logical(&child, 0, total as u64).await;
+        assert_eq!(got, payload, "the fork lost its inherited bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blobstore that fences one stream as its upload starts, as a DELETE
+    /// that lands during a slow `put` does.
+    struct FencesOnPut {
+        inner: crate::blobstore::LocalFsBlobStore,
+        stream: StdMutex<Option<Arc<StreamState>>>,
+    }
+
+    impl crate::blobstore::BlobStore for FencesOnPut {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: bytes::Bytes,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            if let Some(st) = self.stream.lock().unwrap().as_ref() {
+                st.fenced.store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.inner.put(key, body)
+        }
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            start: u64,
+            len: u64,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+            self.inner.get_range(key, start, len)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
+            self.inner.head(key)
+        }
+        fn delete<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A fence that lands while a segment uploads makes the following sidecar
+    /// write a no-op, so the sidecar still lists the segment as Local: its
+    /// chunk must stay, or a restart finds the segment unreadable.
+    #[tokio::test]
+    async fn offload_keeps_the_chunk_when_the_fence_lands_during_the_upload() {
+        let dir = tmp_dir("fence-during-upload");
+        let fencing = Arc::new(FencesOnPut {
+            inner: crate::blobstore::LocalFsBlobStore::new(dir.join("cold")).unwrap(),
+            stream: StdMutex::new(None),
+        });
+        let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
+        let shared: crate::blobstore::SharedBlobStore = fencing.clone();
+        store.blobstore = Some(shared);
+        let store = Arc::new(store);
+        let st = match store.create("s/racing", octet_cfg(), None, 0).unwrap() {
+            CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        *fencing.stream.lock().unwrap() = Some(Arc::clone(&st));
+
+        store.maybe_seal(&st).await;
+        *fencing.stream.lock().unwrap() = None;
+        assert!(st.is_fenced());
+        let disk: Meta =
+            serde_json::from_slice(&std::fs::read(meta_path(&st.file_path)).unwrap()).unwrap();
+        assert_eq!(disk.segments.len(), 1, "sealing went on after the fence");
+        assert!(disk.segments[0].remote_key.is_none());
+        let chunk = disk.segments[0]
+            .local_file
+            .clone()
+            .expect("the sidecar lists the segment as local");
+        assert!(
+            dir.join("segments").join(&chunk).exists(),
+            "the chunk was unlinked though no sidecar records the upload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction persists its intent through a sidecar write, which a fence
+    /// skips: a fenced stream's live file is left as it is.
+    #[tokio::test]
+    async fn compaction_leaves_a_fenced_stream_alone() {
+        let dir = tmp_dir("compact-fenced");
+        let (file_path, live_len) = {
+            let mut cfg = local_tier(&dir, 64 * 1024);
+            cfg.compact_bytes = 0;
+            let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+            let (st, _) = offloaded_stream(&store, "s/compact", octet_cfg()).await;
+            let len = std::fs::metadata(&st.file_path).unwrap().len();
+            (st.file_path.clone(), len)
+        };
+
+        // Reopened with compaction on: the sealed prefix is now reclaimable.
+        let mut cfg = local_tier(&dir, 64 * 1024);
+        cfg.compact_bytes = 64 * 1024;
+        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let st = store.get("s/compact").expect("stream recovered");
+        let file_base = st.shared.read().unwrap().file_base;
+        assert_eq!(store.prepare_delete(&st).await, PrepareRetirement::Ready);
+
+        store.maybe_seal(&st).await;
+        assert_eq!(
+            std::fs::metadata(&file_path).unwrap().len(),
+            live_len,
+            "a fenced stream's live file was compacted"
+        );
+        assert_eq!(st.shared.read().unwrap().file_base, file_base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaper's retirement of an expired stream with bytes in the remote
     /// tier removes its local state and its objects and leaves no note.
     #[tokio::test]

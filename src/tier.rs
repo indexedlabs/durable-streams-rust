@@ -519,7 +519,9 @@ impl Store {
     /// No-op when `compact_bytes == 0` or nothing is reclaimable.
     async fn maybe_compact(self: &Arc<Self>, st: &Arc<StreamState>) -> std::io::Result<()> {
         let threshold = self.tier_config.compact_bytes;
-        if threshold == 0 {
+        // A fenced stream's sidecar writes are skipped, so its compaction intent
+        // would never become durable: leave its live file as it is.
+        if threshold == 0 || st.is_fenced() {
             return Ok(());
         }
         // Separate acquisitions (never nest manifest+shared — see seal_loop note).
@@ -824,6 +826,11 @@ impl Store {
         tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
             .await
             .map_err(std::io::Error::other)??;
+        // A fence that landed during the upload skipped that write, so the
+        // sidecar may still list the segment as Local: keep its chunk.
+        if st.is_fenced() {
+            return Ok(());
+        }
         // Now the local chunk file is reclaimable. unlink is safe even with
         // in-flight reads (open fds stay valid after unlink on Unix).
         if let Some(p) = local_path {
@@ -1072,7 +1079,10 @@ impl TierTask {
             // Hard delete arrived mid-backlog: stop uploading (GC owns reclaim now)
             // and fall through to clear `offloading`, so the GC bounded wait sees
             // offloading==false promptly instead of timing out and racing our puts.
-            if st.tier.manifest.lock().unwrap().deleted {
+            // A fenced stream (a recovered soft-deleted fork parent, say) uploads
+            // nothing either: its sidecar writes are skipped, so the flip below
+            // would never be durable.
+            if st.is_fenced() || st.tier.manifest.lock().unwrap().deleted {
                 break;
             }
             let payload = match tokio::fs::read(&path).await {
@@ -1102,6 +1112,8 @@ impl TierTask {
             // Local pointing at a file that no longer exists — the segment
             // becomes permanently unreadable even though the object is in S3.
             match tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await {
+                // A fence that landed meanwhile skipped the write: keep the chunk.
+                Ok(Ok(())) if st.is_fenced() => {}
                 Ok(Ok(())) => {
                     let _ = tokio::fs::remove_file(&path).await;
                 }

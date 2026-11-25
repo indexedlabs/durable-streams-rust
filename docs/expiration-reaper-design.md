@@ -338,12 +338,16 @@ remote object bytes.
 
 ### Tiered streams
 
-`gc_remote_segments` currently spawns an unbounded detached task and remote
-cleanup is best effort. Proactive delete mode must not be combined with S3
-tiering until remote deletion has a persistent GC tombstone and uses the same
-bounded work queue/semaphore. Until then, startup rejects or loudly disables
-proactive `delete` when `tier != off`; `observe`, lazy expiry, and explicit
-delete retain their documented current behavior.
+Hard retirement of a stream with sealed segments first writes a durable
+pending-delete note (`<data file>.tier-delete`, beside its sidecar) naming the
+incarnation's object keys, then unlinks the sidecar and data file. The remote
+deletes still run in a detached task (`gc_remote_segments`), which clears the
+note once every object is gone and keeps it when one fails. Recovery treats a
+note as a delete in progress: it removes that incarnation's sidecar and data
+file before rebuilding streams, reserves its filename ID, and
+`finish_pending_tier_deletes` deletes its objects and clears the note before
+the store serves. Startup therefore accepts proactive `delete` with
+`--tier s3`.
 
 ## Scanner and operating modes
 

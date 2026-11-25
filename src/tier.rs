@@ -352,6 +352,77 @@ fn segment_key(prefix: &str, st: &StreamState, logical_start: u64) -> String {
     format!("{prefix}{fname}/{logical_start:016}")
 }
 
+/// Suffix of a stream incarnation's pending tier-delete note, kept beside its
+/// `.meta` sidecar as `<data file>.tier-delete`.
+pub(crate) const TIER_DELETE_NOTE_SUFFIX: &str = ".tier-delete";
+
+/// A pending tier delete: the remote keys of one stream incarnation, written
+/// durably before any of them, or the stream's local state, is removed, and
+/// cleared once they are all deleted. Startup finishes every note it finds.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TierDeleteNote {
+    keys: Vec<String>,
+}
+
+/// The pending tier-delete note of the stream whose data file is `data_path`.
+pub(crate) fn tier_delete_note_path(data_path: &std::path::Path) -> PathBuf {
+    let mut p = data_path.as_os_str().to_owned();
+    p.push(TIER_DELETE_NOTE_SUFFIX);
+    PathBuf::from(p)
+}
+
+/// The data file a pending tier-delete note belongs to.
+pub(crate) fn tier_delete_note_data_path(note_path: &std::path::Path) -> PathBuf {
+    let note = note_path.as_os_str().to_string_lossy();
+    let data: &str = note.strip_suffix(TIER_DELETE_NOTE_SUFFIX).unwrap_or(&note);
+    PathBuf::from(data)
+}
+
+/// Write a note crash-durably: an fsynced temp file renamed into place, then
+/// its directory fsynced.
+fn write_tier_delete_note(path: &std::path::Path, note: &TierDeleteNote) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(note).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    crate::store::fsync_parent_dir(path)
+}
+
+/// Clear a note once its deletes are done. Its stream's sidecar and data file
+/// share its directory: fsync it first, so a crash can never bring back a
+/// sidecar that lists deleted objects with no note left to finish it.
+fn clear_tier_delete_note(path: &std::path::Path) -> std::io::Result<()> {
+    crate::store::fsync_parent_dir(path)?;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Remove every staged chunk file (`<data file>.seg.<start>`, and its `.tmp`)
+/// of the stream whose data file is named `file_name`.
+async fn remove_chunk_files(seg_dir: &std::path::Path, file_name: &str) {
+    let file_prefix = format!("{file_name}.seg.");
+    if let Ok(mut rd) = tokio::fs::read_dir(seg_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&file_prefix))
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+}
+
 /// Local staged chunk-file name for a sealed segment.
 fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
     let fname = st
@@ -745,9 +816,92 @@ impl Store {
         Ok(())
     }
 
+    /// Durably record the delete of a hard-deleted stream's remote objects
+    /// before any of them, or its local state, is removed. Marks the stream
+    /// deleted first, under the manifest lock it snapshots under, so no seal or
+    /// offload pass uploads an object the note does not name. Returns whether a
+    /// note was written: a stream that never sealed, or a store with no remote
+    /// tier, has no object to delete.
+    pub(crate) fn record_tier_delete(&self, st: &Arc<StreamState>) -> std::io::Result<bool> {
+        if !self.tier_config.enabled() || self.blobstore.is_none() {
+            return Ok(false);
+        }
+        let keys: Vec<String> = {
+            let mut m = st.tier.manifest.lock().unwrap();
+            m.deleted = true;
+            m.segments
+                .iter()
+                .map(|s| segment_key(&self.tier_config.key_prefix, st, s.logical_start))
+                .collect()
+        };
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        write_tier_delete_note(
+            &tier_delete_note_path(&st.file_path),
+            &TierDeleteNote { keys },
+        )?;
+        Ok(true)
+    }
+
+    /// Finish every tier delete a crash interrupted, before the store serves:
+    /// delete the objects each pending note names and its stream's staged
+    /// chunk files, then clear the note. Recovery already removed each noted
+    /// stream's sidecar and data file. A note whose deletes fail is kept, and
+    /// the next start tries again.
+    pub async fn finish_pending_tier_deletes(&self) {
+        let notes = std::mem::take(&mut *self.pending_tier_deletes.lock().unwrap());
+        if notes.is_empty() {
+            return;
+        }
+        let Some(bs) = &self.blobstore else {
+            eprintln!(
+                "WARN: {} pending tier delete(s) kept: no remote tier is configured",
+                notes.len()
+            );
+            return;
+        };
+        let mut finished = 0usize;
+        for note in &notes {
+            match self.finish_tier_delete(bs, note).await {
+                Ok(()) => finished += 1,
+                Err(e) => eprintln!(
+                    "WARN: pending tier delete {} kept for the next start: {e}",
+                    note.display()
+                ),
+            }
+        }
+        eprintln!(
+            "recovery: finished {finished} of {} pending tier delete(s)",
+            notes.len()
+        );
+    }
+
+    async fn finish_tier_delete(
+        &self,
+        bs: &crate::blobstore::SharedBlobStore,
+        note_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let bytes = tokio::fs::read(note_path).await?;
+        let note: TierDeleteNote = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        for key in &note.keys {
+            bs.delete(key).await?;
+        }
+        let data_path = tier_delete_note_data_path(note_path);
+        if let Some(file_name) = data_path.file_name().and_then(|n| n.to_str()) {
+            remove_chunk_files(&self.segments_dir(), file_name).await;
+        }
+        let note_path = note_path.to_path_buf();
+        tokio::task::spawn_blocking(move || clear_tier_delete_note(&note_path))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     /// Delete every remote object backing a hard-deleted stream's sealed
-    /// segments. Called only on hard delete (ref_count == 0).
-    pub fn gc_remote_segments(&self, st: &Arc<StreamState>) {
+    /// segments, then clear its pending tier-delete note when `noted` (see
+    /// `record_tier_delete`). A failed delete keeps the note for the next
+    /// start. Called only on hard delete (ref_count == 0).
+    pub fn gc_remote_segments(&self, st: &Arc<StreamState>, noted: bool) {
         if !self.tier_config.enabled() {
             return;
         }
@@ -763,13 +917,13 @@ impl Store {
         // Deterministic on-disk prefix for this stream's chunk files
         // (`<fname>.seg.<start>`), used as a GC backstop for chunks staged on disk
         // but not yet in the manifest snapshot.
-        let file_prefix = format!(
-            "{}.seg.",
-            st.file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("stream")
-        );
+        let file_name = st
+            .file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("stream")
+            .to_string();
+        let note = noted.then(|| tier_delete_note_path(&st.file_path));
         let st = st.clone();
         tokio::spawn(async move {
             // Wait out any pass that was already inside its offloading window so we
@@ -805,9 +959,13 @@ impl Store {
                 (keys, local)
             };
             // Remote deletes (only when a blobstore is configured)…
+            let mut all_deleted = true;
             if let Some(bs) = bs {
                 for k in keys {
-                    let _ = bs.delete(&k).await;
+                    if let Err(e) = bs.delete(&k).await {
+                        all_deleted = false;
+                        tracing::warn!(stream = %st.path, key = %k, error = %e, "tier object delete failed; its pending-delete note is kept for the next start");
+                    }
                 }
             }
             // …and unlink any still-staged local chunk files (reclaimed even for a
@@ -818,14 +976,16 @@ impl Store {
             // Backstop sweep: remove any chunk file of this stream the manifest
             // snapshot missed — e.g. a chunk staged on disk before it was recorded
             // when a seal pass was cut short, or a leftover `.tmp` write.
-            if let Ok(mut rd) = tokio::fs::read_dir(&seg_dir).await {
-                while let Ok(Some(entry)) = rd.next_entry().await {
-                    if entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with(&file_prefix))
-                    {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
+            remove_chunk_files(&seg_dir, &file_name).await;
+            // Every object is gone: the note has nothing left to finish.
+            if let Some(note) = note.filter(|_| all_deleted) {
+                match tokio::task::spawn_blocking(move || clear_tier_delete_note(&note)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(stream = %st.path, error = %e, "tier delete note not cleared; the next start finishes it")
+                    }
+                    Err(e) => {
+                        tracing::warn!(stream = %st.path, error = %e, "tier delete note clear task failed; the next start finishes it")
                     }
                 }
             }

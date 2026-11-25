@@ -824,6 +824,10 @@ pub struct Store {
     quarantined_streams: AtomicBool,
     quarantined_stream_ids_complete: AtomicBool,
     quarantined_stream_ids: RwLock<HashSet<u64>>,
+    /// Pending tier-delete notes recovery found: their streams' local state is
+    /// already removed, and `finish_pending_tier_deletes` deletes their remote
+    /// objects before the store serves.
+    pub(crate) pending_tier_deletes: StdMutex<Vec<PathBuf>>,
 }
 
 /// A read-only stream projection used by the bounded administrative inventory.
@@ -1196,6 +1200,7 @@ impl Store {
             quarantined_streams: AtomicBool::new(false),
             quarantined_stream_ids_complete: AtomicBool::new(true),
             quarantined_stream_ids: RwLock::new(HashSet::new()),
+            pending_tier_deletes: StdMutex::new(Vec::new()),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -1218,6 +1223,7 @@ impl Store {
         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
         let mut data_files: Vec<PathBuf> = Vec::new();
         let mut quarantined: Vec<PathBuf> = Vec::new();
+        let mut tier_delete_notes: Vec<PathBuf> = Vec::new();
         let mut max_id = 0u64;
         let mut entries: Vec<PathBuf> = Vec::new();
         for lane in 0..stream_lanes() {
@@ -1241,6 +1247,12 @@ impl Store {
             }
             if name.ends_with(".meta.tmp") {
                 let _ = std::fs::remove_file(&p);
+            } else if name.ends_with(".tier-delete.tmp") {
+                // A tier-delete note that never became durable: nothing of its
+                // stream was removed yet, so the stream recovers as usual.
+                let _ = std::fs::remove_file(&p);
+            } else if name.ends_with(crate::tier::TIER_DELETE_NOTE_SUFFIX) {
+                tier_delete_notes.push(p);
             } else if name.ends_with(".compact.tmp") {
                 // A compaction temp file. It belongs to its data file and is
                 // handled by `recover_one_inner` (promoted when it holds the
@@ -1313,6 +1325,37 @@ impl Store {
             } else {
                 data_files.push(p);
             }
+        }
+        // A tier-delete note names a stream incarnation whose delete began
+        // before the crash. Finish its local part before streams are rebuilt,
+        // so it is never served again and its fork parent's reference is
+        // reconciled without it; `finish_pending_tier_deletes` deletes its
+        // remote objects before the store serves. Its id stays reserved so a
+        // new stream can never take the data-file name the note names.
+        if !tier_delete_notes.is_empty() {
+            let noted: HashSet<PathBuf> = tier_delete_notes
+                .iter()
+                .map(|note| crate::tier::tier_delete_note_data_path(note.as_path()))
+                .collect();
+            metas.retain(|_, entry| !noted.contains(&entry.1));
+            data_files.retain(|data_path| !noted.contains(data_path));
+            for data_path in &noted {
+                remove_file_if_present_measured(&meta_path(data_path))?;
+                remove_file_if_present_measured(data_path)?;
+                if let Some(id) = data_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.rsplit_once('~'))
+                    .and_then(|(_, id)| id.parse::<u64>().ok())
+                {
+                    max_id = max_id.max(id);
+                }
+            }
+            eprintln!(
+                "recovery: {} stream(s) with a pending tier delete removed",
+                noted.len()
+            );
+            *self.pending_tier_deletes.lock().unwrap() = tier_delete_notes;
         }
         // Drop orphan data files (no usable sidecar) — but NEVER a data file
         // whose sidecar was quarantined above. Index the kept paths once: a
@@ -2197,7 +2240,7 @@ impl Store {
             })
         } else {
             let fp = st.file_path.clone();
-            let reclaimed_local_bytes = {
+            let (reclaimed_local_bytes, tier_delete_noted) = {
                 // The metadata barrier acquired above stays held through unlink
                 // so no deferred writer can recreate the sidecar afterwards.
                 #[cfg(test)]
@@ -2206,15 +2249,18 @@ impl Store {
                         "injected hard-delete durability failure",
                     ));
                 }
+                // Record the remote objects' delete before any of the stream's
+                // state is removed; from here a crash is finished at startup.
+                let noted = self.record_tier_delete(st)?;
                 let mut reclaimed = remove_file_if_present_measured(&meta_path(&fp))?;
                 reclaimed = reclaimed.saturating_add(remove_file_if_present_measured(&fp)?);
                 if durability == RetirementDurability::Explicit {
                     fsync_parent_dir(&fp)?;
                 }
-                reclaimed
+                (reclaimed, noted)
             };
             // Safe only after a true hard delete with no remaining fork refs.
-            self.gc_remote_segments(st);
+            self.gc_remote_segments(st, tier_delete_noted);
             let cascade = self.release_parent_once(st, durability)?;
             Ok(PhysicalRetirementStep {
                 outcome: RetirementOutcome::Reaped,

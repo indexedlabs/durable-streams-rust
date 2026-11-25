@@ -487,11 +487,20 @@ mod cors_policy_tests {
     }
 }
 
+/// `GET /_admin/inventory`: one page of streams in path order, with
+/// `next_cursor` while more remain. `prefix` narrows the listing to paths
+/// starting with it. A stable listing is fenced: a later page answers 409 once
+/// the store changed. `stable=false` pages past writes and omits soft-deleted
+/// streams; a page examines a bounded number of entries, so a run of
+/// tombstones can return fewer than `limit` rows, even none, with a
+/// `next_cursor` to page on from.
 fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
     const DEFAULT_LIMIT: usize = 100;
     const MAX_LIMIT: usize = 1000;
     let mut cursor: Option<(u64, String)> = None;
     let mut limit = DEFAULT_LIMIT;
+    let mut prefix = String::new();
+    let mut stable = true;
     if let Some(query) = query {
         for part in query.split('&') {
             let Some((key, value)) = part.split_once('=') else {
@@ -506,27 +515,38 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
                     Ok(n) if (1..=MAX_LIMIT).contains(&n) => limit = n,
                     _ => return text_response(400, "inventory limit must be 1..=1000"),
                 },
+                "prefix" => match percent_encoding::percent_decode_str(value).decode_utf8() {
+                    Ok(value) => prefix = value.into_owned(),
+                    Err(_) => return text_response(400, "invalid inventory prefix"),
+                },
+                "stable" => match value {
+                    "true" => stable = true,
+                    "false" => stable = false,
+                    _ => return text_response(400, "inventory stable must be true or false"),
+                },
                 _ => return text_response(400, "unknown inventory query parameter"),
             }
         }
     }
-    let (generation, entries, more) = match store.inventory_page(
-        cursor.as_ref().map(|(generation, _)| *generation),
+    // A stable listing is fenced to the inventory version its first page
+    // saw; `stable=false` pages on from the cursor's path whatever changed,
+    // and lists only streams that exist, never soft-deleted tombstones.
+    let (generation, entries, resume) = match store.inventory_page_under(
+        &prefix,
+        cursor
+            .as_ref()
+            .filter(|_| stable)
+            .map(|(generation, _)| *generation),
         cursor.as_ref().map(|(_, path)| path.as_str()),
         limit,
+        !stable,
     ) {
         Ok(page) => page,
         Err(crate::store::InventoryPageError::GenerationChanged) => {
             return text_response(409, "inventory changed; restart pagination")
         }
     };
-    let next_cursor = if more {
-        entries
-            .last()
-            .map(|entry| encode_inventory_cursor(generation, &entry.path))
-    } else {
-        None
-    };
+    let next_cursor = resume.map(|path| encode_inventory_cursor(generation, &path));
     #[derive(serde::Serialize)]
     struct Item<'a> {
         path: &'a str,
@@ -3309,6 +3329,287 @@ mod admin_inventory_tests {
             inventory_response(&store, Some(&format!("cursor={cursor}"))).status,
             409
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn write(store: &Arc<Store>, method: Method, path: &str, body: &'static [u8]) -> u16 {
+        handle(
+            Arc::clone(store),
+            Req {
+                method,
+                path: path.into(),
+                query: None,
+                headers: vec![("content-type".into(), "application/octet-stream".into())],
+                body: bytes::Bytes::from_static(body),
+            },
+        )
+        .await
+        .status
+    }
+
+    fn inventory_json(store: &Store, query: &str) -> (u16, serde_json::Value) {
+        let response = inventory_response(store, Some(query));
+        let status = response.status;
+        let Body::Full(body) = response.body else {
+            panic!("inventory must be a fixed JSON response")
+        };
+        let value = if status == 200 {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            serde_json::Value::Null
+        };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn unstable_prefix_listing_pages_to_its_end_while_the_store_takes_writes() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir =
+            std::env::temp_dir().join(format!("ds-inventory-unstable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let existing = ["a.1", "a.2", "a.3", "a.4", "a.5", "a.6", "a.7"];
+        for path in existing.iter().chain(&["a", "a/1", "ab.1", "b.1"]) {
+            assert_eq!(write(&store, Method::Put, path, b"").await, 201, "{path}");
+        }
+
+        let mut listed: Vec<String> = Vec::new();
+        let mut query = "prefix=a.&stable=false&limit=2".to_string();
+        let mut fenced_cursor = None;
+        let mut round = 0;
+        loop {
+            let (status, page) = inventory_json(&store, &query);
+            assert_eq!(status, 200, "page {round} must not need a restart");
+            for item in page["streams"].as_array().unwrap() {
+                listed.push(item["path"].as_str().unwrap().to_string());
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            if round == 0 {
+                // The same first page, fenced, for the 409 check below.
+                let (_, fenced) = inventory_json(&store, "prefix=a.&limit=2");
+                fenced_cursor = Some(fenced["next_cursor"].as_str().unwrap().to_string());
+            }
+            // Writes between pages: append to listed and unlisted streams,
+            // create streams inside and outside the prefix on both sides of
+            // the cursor, and delete one stream not yet listed.
+            round += 1;
+            assert_eq!(write(&store, Method::Post, "a.1", b"x").await, 204);
+            assert_eq!(write(&store, Method::Post, "a.6", b"y").await, 204);
+            for created in [
+                format!("a.0-{round}"),
+                format!("a.9-{round}"),
+                format!("b.new-{round}"),
+            ] {
+                assert_eq!(write(&store, Method::Put, &created, b"").await, 201);
+            }
+            if round == 1 {
+                assert_eq!(write(&store, Method::Delete, "a.5", b"").await, 204);
+            }
+            query = format!("prefix=a.&stable=false&limit=2&cursor={cursor}");
+        }
+
+        assert!(round >= 3, "the listing spanned several pages");
+        assert!(
+            listed.iter().all(|path| path.starts_with("a.")),
+            "{listed:?}"
+        );
+        assert!(
+            listed.windows(2).all(|pair| pair[0] < pair[1]),
+            "{listed:?}"
+        );
+        for path in existing.iter().filter(|path| **path != "a.5") {
+            assert_eq!(
+                listed.iter().filter(|seen| seen == path).count(),
+                1,
+                "{path} existed throughout and is listed exactly once: {listed:?}"
+            );
+        }
+
+        let fenced_cursor = fenced_cursor.unwrap();
+        let (status, _) =
+            inventory_json(&store, &format!("prefix=a.&limit=2&cursor={fenced_cursor}"));
+        assert_eq!(status, 409, "without stable=false the listing stays fenced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unstable_listing_omits_soft_deleted_fork_parents_on_every_page() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir =
+            std::env::temp_dir().join(format!("ds-inventory-tombstone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for path in ["p.0-dead", "p.a", "p.parent", "p.z"] {
+            assert_eq!(write(&store, Method::Put, path, b"").await, 201, "{path}");
+        }
+        // Each parent keeps a child, so deleting it leaves a tombstone.
+        for (child, parent) in [("q.child0", "p.0-dead"), ("q.child1", "p.parent")] {
+            let forked = handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Put,
+                    path: child.into(),
+                    query: None,
+                    headers: vec![
+                        ("content-type".into(), "application/octet-stream".into()),
+                        ("stream-forked-from".into(), parent.into()),
+                        ("stream-fork-offset".into(), "now".into()),
+                    ],
+                    body: bytes::Bytes::new(),
+                },
+            )
+            .await;
+            assert_eq!(forked.status, 201, "{child}");
+        }
+        assert_eq!(write(&store, Method::Delete, "p.0-dead", b"").await, 204);
+        let paths = |page: &serde_json::Value| -> Vec<String> {
+            page["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (status, first) = inventory_json(&store, "prefix=p.&stable=false&limit=1");
+        assert_eq!(status, 200);
+        assert_eq!(
+            paths(&first),
+            ["p.a"],
+            "a tombstone from before the listing is omitted"
+        );
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+        assert_eq!(write(&store, Method::Delete, "p.parent", b"").await, 204);
+        let (_, stable) = inventory_json(&store, "prefix=p.");
+        let parent = &stable["streams"].as_array().unwrap()[2];
+        assert_eq!(parent["path"], "p.parent");
+        assert_eq!(parent["deleted"], true, "the parent is kept as a tombstone");
+        assert_eq!(stable["streams"][0]["path"], "p.0-dead");
+        assert_eq!(
+            stable["streams"][0]["deleted"], true,
+            "the stable listing still shows tombstones"
+        );
+
+        let mut listed = paths(&first);
+        let mut query = format!("prefix=p.&stable=false&limit=1&cursor={cursor}");
+        loop {
+            let (status, page) = inventory_json(&store, &query);
+            assert_eq!(status, 200);
+            assert!(page["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["deleted"] == false));
+            listed.extend(paths(&page));
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            query = format!("prefix=p.&stable=false&limit=1&cursor={cursor}");
+        }
+        assert_eq!(
+            listed,
+            ["p.a", "p.z"],
+            "the continuation omits the new tombstone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unstable_listing_bounds_its_scan_and_pages_on_past_tombstones() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir =
+            std::env::temp_dir().join(format!("ds-inventory-scan-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        // At limit=1 a page examines at most 10 entries; leave 11 tombstones
+        // under the prefix, then one live stream after them.
+        let parents: Vec<String> = (0..11).map(|n| format!("t.{n:02}")).collect();
+        for parent in &parents {
+            assert_eq!(write(&store, Method::Put, parent, b"").await, 201);
+            let forked = handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Put,
+                    path: format!("u.{parent}"),
+                    query: None,
+                    headers: vec![
+                        ("content-type".into(), "application/octet-stream".into()),
+                        ("stream-forked-from".into(), parent.clone()),
+                        ("stream-fork-offset".into(), "now".into()),
+                    ],
+                    body: bytes::Bytes::new(),
+                },
+            )
+            .await;
+            assert_eq!(forked.status, 201, "{parent}");
+            assert_eq!(write(&store, Method::Delete, parent, b"").await, 204);
+        }
+        assert_eq!(write(&store, Method::Put, "t.live", b"").await, 201);
+
+        let (status, first) = inventory_json(&store, "prefix=t.&stable=false&limit=1");
+        assert_eq!(status, 200);
+        assert!(first["streams"].as_array().unwrap().is_empty(), "{first}");
+        let mut cursor = first["next_cursor"]
+            .as_str()
+            .expect("an empty page that hit the scan bound carries a cursor")
+            .to_string();
+        let mut listed = Vec::new();
+        let mut pages = 1;
+        loop {
+            let (status, page) = inventory_json(
+                &store,
+                &format!("prefix=t.&stable=false&limit=1&cursor={cursor}"),
+            );
+            assert_eq!(status, 200);
+            pages += 1;
+            assert!(pages <= 3, "paging past the tombstones must end");
+            for item in page["streams"].as_array().unwrap() {
+                listed.push(item["path"].as_str().unwrap().to_string());
+            }
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = next.to_string(),
+                None => break,
+            }
+        }
+        assert_eq!(listed, ["t.live"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inventory_prefix_filters_the_fenced_listing_and_rejects_bad_parameters() {
+        let dir = std::env::temp_dir().join(format!("ds-inventory-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        for path in ["a", "a.1", "a.2", "a%2", "ab", "b.1"] {
+            store.create(path, stream_config(), None, 0).unwrap();
+        }
+        let paths = |page: &serde_json::Value| -> Vec<String> {
+            page["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (status, page) = inventory_json(&store, "prefix=a.");
+        assert_eq!(status, 200);
+        assert_eq!(paths(&page), ["a.1", "a.2"]);
+        assert!(page["next_cursor"].is_null());
+        let (_, page) = inventory_json(&store, "prefix=a%252");
+        assert_eq!(paths(&page), ["a%2"], "the prefix is percent-decoded");
+        let (_, page) = inventory_json(&store, "prefix=a.&stable=true&limit=1");
+        assert_eq!(paths(&page), ["a.1"]);
+        let cursor = page["next_cursor"].as_str().unwrap().to_string();
+        let (_, page) = inventory_json(&store, &format!("prefix=a.&cursor={cursor}"));
+        assert_eq!(paths(&page), ["a.2"]);
+        // A cursor before the prefix starts the listing at the prefix.
+        let (_, page) = inventory_json(&store, &format!("prefix=b.&stable=false&cursor={cursor}"));
+        assert_eq!(paths(&page), ["b.1"]);
+        assert_eq!(inventory_json(&store, "stable=no").0, 400);
+        assert_eq!(inventory_json(&store, "prefix=%FF").0, 400);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -287,6 +287,24 @@ Durable: in `wal` mode (the default), an append returns only after its record is
 
 In `memory` mode there is no WAL and no WAL replay. Recovery is a sidecar pass: each stream is rebuilt from its per-stream data file and `.meta` sidecar; durability is delegated to (future) replication.
 
+### Listing streams
+
+`GET /_admin/inventory` lists the store's streams in path order, up to `limit`
+(default 100, at most 1,000) a page: each stream's path, whether it is closed
+or deleted, and its durable bytes. A page returns `next_cursor` while more
+remain; pass it back as `cursor`.
+
+| Parameter | Effect |
+| --- | --- |
+| `prefix` | Returns only streams whose path starts with it |
+| `stable=false` | Pages past changes to the store and omits deleted streams: the listing returns every stream that existed when it began and was not deleted since |
+| neither | The listing is fenced: a later page answers 409 once any stream has been appended to, created or deleted since the first page |
+
+With `stable=false` a page examines at most ten times `limit` entries, so a
+run of deleted streams kept for their forks can end a page with fewer rows
+than `limit`, or none, and a `next_cursor`. Page on from it as usual; the
+listing has ended only when a page has no `next_cursor`.
+
 ## How it's built
 
 - **Contiguous wire-byte storage** — each stream's data file holds exactly the bytes that go on the wire, so a catch-up read is a literal byte range. No reframing, no per-message copies.

@@ -21,9 +21,11 @@ COPY src ./src
 # OTLP/gRPC to the endpoint the standard `OTEL_*` variables name. An `https://`
 # endpoint such as Logfire (`https://logfire-us.pydantic.dev`) is reached over
 # TLS, trusting the runtime stage's CA bundle (/etc/ssl/certs, which the
-# distroless base ships). A default build exports no metrics. No `tier`: to ship
-# S3 tiering, add it here.
-RUN cargo build --release --locked --features telemetry
+# distroless base ships). A default build exports no metrics. Built with `tier`
+# too, so one image serves a store that runs the S3 tier (`--tier s3`) and one that
+# leaves it off. With no S3 keys in its environment, the tier signs with the host's
+# role (the ECS task role, else the instance profile).
+RUN cargo build --release --locked --features telemetry,tier
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
 # Its /etc/ssl/certs/ca-certificates.crt holds the roots the OTLP exporter trusts.

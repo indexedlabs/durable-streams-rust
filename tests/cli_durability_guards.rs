@@ -473,30 +473,37 @@ fn proactive_expiry_reaping_starts_with_s3_tiering() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The deleting reaper with the S3 tier, end to end against a local S3 such
-/// as MinIO: an expired stream with bytes in the bucket is gone from the SSD
-/// and from the bucket. Needs `--features tier`, `DS_TEST_S3_ENDPOINT` (e.g.
-/// `http://127.0.0.1:9000`), `DS_TEST_S3_BUCKET` (an existing bucket) and
-/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; skipped without them.
+/// The deleting reaper with the S3 tier against a local S3: an expired stream
+/// with bytes in the bucket is gone from the SSD and from the bucket. Ignored by
+/// default; CI's `tier` job runs it against moto's server. To run it by hand,
+/// start a local S3 on 127.0.0.1:9000 with an existing bucket, then:
+///
+///   DS_S3_BUCKET=ds-tier-test DS_S3_ACCESS_KEY_ID=… DS_S3_SECRET_ACCESS_KEY=… \
+///   cargo test --features tier --test cli_durability_guards \
+///     delete_mode_removes_an_expired_tiered_stream -- --ignored
 #[cfg(feature = "tier")]
 #[test]
+#[ignore]
 fn delete_mode_removes_an_expired_tiered_stream_from_the_ssd_and_the_bucket() {
     use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
 
-    let (Ok(endpoint), Ok(bucket)) = (
-        std::env::var("DS_TEST_S3_ENDPOINT"),
-        std::env::var("DS_TEST_S3_BUCKET"),
-    ) else {
-        eprintln!("skipped: DS_TEST_S3_ENDPOINT and DS_TEST_S3_BUCKET are not set");
-        return;
-    };
-    let s3 = AmazonS3Builder::from_env()
+    let endpoint = "http://127.0.0.1:9000".to_string();
+    let bucket = std::env::var("DS_S3_BUCKET").unwrap_or_else(|_| "ds-tier-test".into());
+    let mut builder = AmazonS3Builder::new()
         .with_endpoint(endpoint.clone())
+        .with_region("us-east-1")
         .with_bucket_name(bucket.clone())
         .with_allow_http(true)
-        .with_virtual_hosted_style_request(false)
-        .build()
-        .expect("test S3 client");
+        .with_virtual_hosted_style_request(false);
+    if let (Ok(key), Ok(secret)) = (
+        std::env::var("DS_S3_ACCESS_KEY_ID"),
+        std::env::var("DS_S3_SECRET_ACCESS_KEY"),
+    ) {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let s3 = builder.build().expect("test S3 client");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -527,6 +534,8 @@ fn delete_mode_removes_an_expired_tiered_stream_from_the_ssd_and_the_bucket() {
         "s3",
         "--tier-endpoint",
         endpoint.as_str(),
+        "--tier-region",
+        "us-east-1",
         "--tier-bucket",
         bucket.as_str(),
         "--tier-key-prefix",

@@ -1017,6 +1017,8 @@ impl Store {
             inventory.generation = inventory.generation.wrapping_add(1);
         }
     }
+    /// The whole inventory, paged; only tests list without a prefix.
+    #[cfg(test)]
     pub fn inventory_page(
         &self,
         generation: Option<u64>,

@@ -73,16 +73,17 @@ jobs:
         run: cargo clippy --release --locked --all-targets --features telemetry -- -D warnings
 
   # The release image builds with `tier` too, and no other job compiles it. This one
-  # tests and lints it, checks the S3 adapter against a local MinIO, and runs the
-  # conformance suite with `--tier s3` on that bucket. Segments are 4 KiB here so the
-  # suite's streams seal, offload and read back from the bucket (the 8 MiB default
-  # would leave every stream local).
+  # tests and lints it, checks the S3 adapter against a local S3 (moto's server, from
+  # PyPI: MinIO's images are no longer on Docker Hub), and runs the conformance suite
+  # with `--tier s3` on that bucket. Segments are 4 KiB here so the suite's streams
+  # seal, offload and read back from the bucket (the 8 MiB default would leave every
+  # stream local).
   tier:
-    name: tier (S3 adapter + conformance against MinIO)
+    name: tier (S3 adapter + conformance against a local S3)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
+      MOTO_VERSION: 5.2.5
       DS_S3_BUCKET: ds-tier-ci
     steps:
       - uses: actions/checkout@v4
@@ -91,35 +92,35 @@ jobs:
         with:
           components: clippy
 
-      - name: Start MinIO
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
-        run: |
-          docker run -d --name minio -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            "$MINIO_IMAGE" server /data
-          for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:9000/minio/health/live && break
-            sleep 1
-          done
-          aws --endpoint-url http://127.0.0.1:9000 s3 mb "s3://$DS_S3_BUCKET"
-
       - name: Build
         run: cargo build --release --locked --features tier
 
       - name: Test
         run: cargo test --release --locked --features tier
 
-      - name: S3 adapter against MinIO
-        env:
-          DS_S3_ACCESS_KEY_ID: minioadmin
-          DS_S3_SECRET_ACCESS_KEY: minioadmin
-        run: cargo test --release --locked --features tier s3_minio_roundtrip -- --ignored
-
       - name: Clippy
         run: cargo clippy --release --locked --all-targets --features tier -- -D warnings
+
+      - name: Start a local S3
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/pip" install --quiet "moto[server]==$MOTO_VERSION"
+          nohup "$RUNNER_TEMP/moto/bin/moto_server" -H 127.0.0.1 -p 9000 > "$RUNNER_TEMP/moto.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:9000/moto-api/ && break
+            sleep 1
+          done
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb "s3://$DS_S3_BUCKET"
+
+      - name: S3 adapter against the local S3
+        env:
+          DS_S3_ACCESS_KEY_ID: test
+          DS_S3_SECRET_ACCESS_KEY: test
+        run: cargo test --release --locked --features tier s3_minio_roundtrip -- --ignored
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -130,8 +131,8 @@ jobs:
 
       - name: Run conformance (tier-s3)
         env:
-          DS_S3_ACCESS_KEY_ID: minioadmin
-          DS_S3_SECRET_ACCESS_KEY: minioadmin
+          DS_S3_ACCESS_KEY_ID: test
+          DS_S3_SECRET_ACCESS_KEY: test
           RUST_SERVER_ARGS: >-
             --tier s3 --tier-endpoint http://127.0.0.1:9000 --tier-region us-east-1
             --tier-bucket ds-tier-ci --tier-key-prefix conformance/ --tier-allow-http
@@ -141,14 +142,14 @@ jobs:
       - name: Objects the conformance run offloaded
         if: always()
         env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
         run: aws --endpoint-url http://127.0.0.1:9000 s3 ls --recursive --summarize "s3://$DS_S3_BUCKET/conformance/" | tail -3
 
-      - name: MinIO log
+      - name: Local S3 log
         if: failure()
-        run: docker logs minio 2>&1 | tail -50
+        run: tail -50 "$RUNNER_TEMP/moto.log" || true
 
   conformance:
     name: conformance (${{ matrix.config.name }})

@@ -7,18 +7,22 @@
 //     --idle <seconds | never | default> [--commit] [--rate <requests per second>]
 //
 // Without `--commit` it is a dry run: it prints how many streams match and their
-// durable bytes, and sends no PATCH. With `--commit` it PATCHes each stream at
-// `--rate` a second, retries a request that failed in transit or answered 5xx or
-// 429, prints progress, and exits 1 if any stream failed. A stream deleted since
-// the listing (404 or 410) is skipped, not failed. Running it again is safe:
-// repeating the PATCH changes nothing. Stream paths start with `/`; a
-// prefix without one gets it.
+// durable bytes, and sends no PATCH. With `--commit` it PATCHes each stream,
+// starting at most `--rate` requests a second (retries included), retries a
+// request that failed in transit or answered 5xx or 429, prints progress, and
+// exits 1 if any stream failed. A PATCH answered 404 or 410 is skipped only when
+// a HEAD confirms the stream is gone. Redirects are never followed, and a path
+// that URL parsing would rewrite (a `.` or `..` segment, say) is never sent.
+// Running it again is safe: repeating the PATCH changes nothing. Stream paths
+// start with `/`; a prefix without one gets it.
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const USAGE = `usage: set-stream-idle-time --base-url <store> --prefix <path prefix> --idle <seconds | never | default> [--commit] [--rate <requests per second>]`
 const DEFAULT_RATE = 10
+const MIN_RATE = 0.01
+const MAX_RATE = 1000
 const PAGE_SIZE = 1000
 const MAX_ATTEMPTS = 4
 const REQUEST_TIMEOUT_MS = 30_000
@@ -47,32 +51,39 @@ export async function listStreams({ baseUrl, prefix, pageSize = PAGE_SIZE }) {
   return streams
 }
 
-// PATCHes each stream's idle time, starting at most `rate` requests a second. A
-// stream that answers 404 or 410 was deleted since the listing and is skipped.
+// PATCHes each stream's idle time, starting at most `rate` requests a second,
+// retries and HEADs included. A PATCH answered 404 or 410 is skipped only when a
+// HEAD of the same stream also answers 404 or 410; anything else there means a
+// route or gateway refused the PATCH, and the stream fails.
 export async function setIdleTimes({ baseUrl, streams, idle, rate, out = console.log, err = console.error }) {
-  const interval = 1000 / rate
-  let next = Date.now()
+  const pace = pacer(rate)
   let lastProgress = Date.now()
   let changed = 0
   const skipped = []
   const failed = []
+  const fail = (path, reason) => {
+    failed.push({ path, reason })
+    err(`failed: ${path}: ${reason}`)
+  }
   for (const [index, stream] of streams.entries()) {
-    const wait = next - Date.now()
-    if (wait > 0) await sleep(wait)
-    next = Math.max(next, Date.now()) + interval
-    const { response, error, attempts } = await request(`${baseUrl}${stream.path}`, {
-      method: `PATCH`,
-      headers: { 'stream-tier-after-idle': idle },
-    })
-    if (response?.ok) {
-      changed += 1
-    } else if (response?.status === 404 || response?.status === 410) {
-      skipped.push(stream.path)
-      out(`skipped (deleted since listing): ${stream.path}`)
+    const url = streamUrl(baseUrl, stream.path)
+    if (!url) {
+      fail(stream.path, `URL parsing would rewrite this path; no PATCH sent`)
     } else {
-      const reason = `${describe(response, error)} after ${attempts} attempt${attempts === 1 ? `` : `s`}`
-      failed.push({ path: stream.path, reason })
-      err(`failed: ${stream.path}: ${reason}`)
+      const patch = await request(url, { method: `PATCH`, headers: { 'stream-tier-after-idle': idle } }, pace)
+      if (patch.response?.ok) {
+        changed += 1
+      } else if (isGone(patch.response)) {
+        const head = await request(url, { method: `HEAD` }, pace)
+        if (isGone(head.response)) {
+          skipped.push(stream.path)
+          out(`skipped (deleted since listing): ${stream.path}`)
+        } else {
+          fail(stream.path, `PATCH answered ${describe(patch.response)} but HEAD answered ${outcome(head)}`)
+        }
+      } else {
+        fail(stream.path, outcome(patch))
+      }
     }
     if (Date.now() - lastProgress >= PROGRESS_EVERY_MS) {
       lastProgress = Date.now()
@@ -137,7 +148,9 @@ function parseOptions(argv) {
     throw new Error(`--idle must be seconds, never or default`)
   }
   const rate = values.rate === undefined ? DEFAULT_RATE : Number(values.rate)
-  if (!Number.isFinite(rate) || rate <= 0) throw new Error(`--rate must be a positive number`)
+  if (!(rate >= MIN_RATE && rate <= MAX_RATE)) {
+    throw new Error(`--rate must be from ${MIN_RATE} to ${MAX_RATE} requests a second`)
+  }
   return {
     baseUrl: base.replace(/\/+$/, ``),
     prefix: values.prefix.startsWith(`/`) ? values.prefix : `/${values.prefix}`,
@@ -151,16 +164,52 @@ function isSeconds(value) {
   return /^(0|[1-9][0-9]*)$/.test(value) && BigInt(value) <= 18446744073709551615n
 }
 
-// One request, retried while it fails in transit or answers 5xx or 429.
-async function request(url, init) {
+// The stream's URL, or null when URL parsing would not send the listed path as
+// it is: `.` and `..` segments (`%2e` spellings too) are resolved away, `\`
+// becomes `/`, and `?`, `#` or characters that need escaping change the target.
+function streamUrl(baseUrl, path) {
+  let url
+  try {
+    url = new URL(`${baseUrl}${path}`)
+  } catch {
+    return null
+  }
+  const expected = `${new URL(baseUrl).pathname.replace(/\/$/, ``)}${path}`
+  return url.pathname === expected && !url.search && !url.hash ? url.href : null
+}
+
+function isGone(response) {
+  return response?.status === 404 || response?.status === 410
+}
+
+// Resolves when the next request may start, so requests start at most `rate` a
+// second.
+function pacer(rate) {
+  const interval = 1000 / rate
+  let next = Date.now()
+  return async () => {
+    const wait = next - Date.now()
+    if (wait > 0) await sleep(wait)
+    next = Math.max(next, Date.now()) + interval
+  }
+}
+
+// One request, retried while it fails in transit or answers 5xx or 429. Each
+// attempt waits for `pace` when given. Redirects are returned, never followed.
+async function request(url, init, pace) {
   let response = null
   let error = null
   let attempts = 0
   while (attempts < MAX_ATTEMPTS) {
     if (attempts > 0) await sleep(500 * 2 ** (attempts - 1))
+    if (pace) await pace()
     attempts += 1
     try {
-      response = await fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+      response = await fetch(url, {
+        ...init,
+        redirect: `manual`,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      })
       error = null
     } catch (caught) {
       response = null
@@ -171,6 +220,10 @@ async function request(url, init) {
     if (response.status < 500 && response.status !== 429) break
   }
   return { response, error, attempts }
+}
+
+function outcome({ response, error, attempts }) {
+  return `${describe(response, error)} after ${attempts} attempt${attempts === 1 ? `` : `s`}`
 }
 
 function describe(response, error) {

@@ -5960,3 +5960,68 @@ mod recovery_scale_tests {
         assert_eq!(store.quarantined_stream_ids(), vec![parked_id]);
     }
 }
+
+#[cfg(test)]
+mod tier_after_idle_sidecar_tests {
+    use super::*;
+
+    /// A sidecar as a server from before the idle time wrote it.
+    fn old_sidecar() -> serde_json::Value {
+        serde_json::json!({
+            "id": 7,
+            "path": "idle/old",
+            "content_type": "application/octet-stream",
+            "ttl_seconds": null,
+            "expires_at_unix": null,
+            "expires_at_raw": null,
+            "create_closed": false,
+            "forked_from": null,
+            "fork_offset_raw": null,
+            "fork_sub_offset": null,
+            "base_offset": 0,
+            "closed": false,
+            "closed_by": null,
+            "producers": {},
+            "last_seq_header": null,
+            "last_access_unix": 0,
+            "ref_count": 0,
+            "soft_deleted": false
+        })
+    }
+
+    #[test]
+    fn a_sidecar_without_the_idle_time_reads_as_absent_and_is_written_back_unchanged() {
+        let meta: Meta = serde_json::from_value(old_sidecar()).unwrap();
+        assert_eq!(meta.tier_after_idle, None);
+        let written = serde_json::to_value(&meta).unwrap();
+        assert!(
+            written.get("tier_after_idle").is_none(),
+            "a stream that takes the default must not grow the field: {written}"
+        );
+    }
+
+    #[test]
+    fn the_idle_time_is_seconds_or_never_in_the_sidecar() {
+        for (raw, expected) in [
+            (serde_json::json!(600), TierAfterIdle::Secs(600)),
+            (serde_json::json!(0), TierAfterIdle::Secs(0)),
+            (serde_json::json!("never"), TierAfterIdle::Never),
+        ] {
+            let mut sidecar = old_sidecar();
+            sidecar["tier_after_idle"] = raw.clone();
+            let meta: Meta = serde_json::from_value(sidecar).unwrap();
+            assert_eq!(meta.tier_after_idle, Some(expected), "{raw}");
+            assert_eq!(serde_json::to_value(&meta).unwrap()["tier_after_idle"], raw);
+        }
+        for bad in [
+            serde_json::json!("600"),
+            serde_json::json!("Never"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut sidecar = old_sidecar();
+            sidecar["tier_after_idle"] = bad.clone();
+            assert!(serde_json::from_value::<Meta>(sidecar).is_err(), "{bad}");
+        }
+    }
+}

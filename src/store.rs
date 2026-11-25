@@ -4341,13 +4341,11 @@ mod tier_tests {
         if unlink_local {
             std::fs::remove_file(meta_path(&file_path)).unwrap();
             std::fs::remove_file(&file_path).unwrap();
-            let mut deleted = 0;
-            for name in files_under(&dir.join("cold")) {
-                if deleted + objects_left == objects {
-                    break;
-                }
+            for name in files_under(&dir.join("cold"))
+                .into_iter()
+                .skip(objects_left)
+            {
                 std::fs::remove_file(dir.join("cold").join(name)).unwrap();
-                deleted += 1;
             }
             assert_eq!(objects_of(&dir, &file_name), objects_left);
         } else {

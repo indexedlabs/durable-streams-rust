@@ -192,7 +192,7 @@ pub use s3::S3BlobStore;
 #[cfg(feature = "tier")]
 mod s3 {
     use super::*;
-    use object_store::aws::{AmazonS3Builder, Checksum};
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, Checksum};
     use object_store::path::Path as ObjPath;
     use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -208,36 +208,55 @@ mod s3 {
 
     impl S3BlobStore {
         pub fn new(cfg: &crate::tier::TierConfig) -> io::Result<Self> {
-            let bucket = cfg
-                .bucket
-                .as_ref()
-                .ok_or_else(|| io::Error::other("--tier-bucket is required for --tier s3"))?;
-            // S3 checks every put against its SHA-256 (`x-amz-checksum-sha256`)
-            // and refuses a mismatch, so a corrupted upload never becomes the
-            // object the local copy is dropped for.
-            let mut b = AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .with_checksum_algorithm(Checksum::SHA256);
-            if let Some(ep) = &cfg.endpoint {
-                b = b.with_endpoint(ep.clone());
-            }
-            if let Some(region) = &cfg.region {
-                b = b.with_region(region.clone());
-            }
-            // Path-style addressing (vs virtual-hosted) — required by MinIO and
-            // most S3-compatible providers when using a custom endpoint.
-            b = b.with_virtual_hosted_style_request(!cfg.path_style);
-            if cfg.allow_http {
-                b = b.with_allow_http(true);
-            }
-            if let (Some(k), Some(s)) = (&cfg.access_key_id, &cfg.secret_access_key) {
-                b = b
-                    .with_access_key_id(k.clone())
-                    .with_secret_access_key(s.clone());
-            }
-            let inner = b.build().map_err(io::Error::other)?;
+            let inner = s3_builder(cfg)?.build().map_err(io::Error::other)?;
             Ok(S3BlobStore { inner })
         }
+    }
+
+    /// The `object_store` builder for `cfg`, before it resolves credentials.
+    pub(super) fn s3_builder(cfg: &crate::tier::TierConfig) -> io::Result<AmazonS3Builder> {
+        let bucket = cfg
+            .bucket
+            .as_ref()
+            .ok_or_else(|| io::Error::other("--tier-bucket is required for --tier s3"))?;
+        // S3 checks every put against its SHA-256 (`x-amz-checksum-sha256`) and
+        // refuses a mismatch, so a corrupted upload never becomes the object the
+        // local copy is dropped for.
+        let mut b = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_checksum_algorithm(Checksum::SHA256);
+        if let Some(ep) = &cfg.endpoint {
+            b = b.with_endpoint(ep.clone());
+        }
+        if let Some(region) = &cfg.region {
+            b = b.with_region(region.clone());
+        }
+        // Path-style addressing (vs virtual-hosted) — required by MinIO and
+        // most S3-compatible providers when using a custom endpoint.
+        b = b.with_virtual_hosted_style_request(!cfg.path_style);
+        if cfg.allow_http {
+            b = b.with_allow_http(true);
+        }
+        if let (Some(k), Some(s)) = (&cfg.access_key_id, &cfg.secret_access_key) {
+            b = b
+                .with_access_key_id(k.clone())
+                .with_secret_access_key(s.clone());
+        } else {
+            // No static keys: use the host's role. `object_store` reads an EKS web
+            // identity from the environment itself, but takes an ECS task role's
+            // endpoint and the instance-metadata endpoint only when handed them;
+            // without them it asks EC2 instance metadata, which Fargate does not
+            // serve and which on EC2 is the instance's role, not the task's.
+            for key in [
+                AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+                AmazonS3ConfigKey::MetadataEndpoint,
+            ] {
+                if let Ok(v) = std::env::var(key.as_ref().to_ascii_uppercase()) {
+                    b = b.with_config(key, v);
+                }
+            }
+        }
+        Ok(b)
     }
 
     impl BlobStore for S3BlobStore {
@@ -385,5 +404,120 @@ mod tests {
         assert_eq!(&got[..], b"quick");
         bs.delete(key).await.expect("delete");
         assert_eq!(bs.head(key).await.expect("head after delete"), None);
+    }
+
+    // The two host-role tests set process-wide AWS_* variables, so they take turns.
+    #[cfg(feature = "tier")]
+    static AWS_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// With no static keys, an ECS task's role endpoint reaches the S3 client.
+    #[cfg(feature = "tier")]
+    #[test]
+    fn s3_without_keys_takes_the_ecs_task_role() {
+        use object_store::aws::AmazonS3ConfigKey;
+        let _env = AWS_ENV.blocking_lock();
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/test",
+        );
+        let cfg = crate::tier::TierConfig {
+            kind: crate::tier::TierKind::S3,
+            bucket: Some("ds-role-test".into()),
+            ..Default::default()
+        };
+        let b = s3::s3_builder(&cfg);
+        std::env::remove_var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        assert_eq!(
+            b.expect("builder")
+                .get_config_value(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri)
+                .as_deref(),
+            Some("/v2/credentials/test")
+        );
+    }
+
+    /// With no static keys, the S3 client signs with the credentials the host's
+    /// instance metadata hands out. One local server plays both the metadata
+    /// endpoint and the bucket, and records what each request was signed with.
+    #[cfg(feature = "tier")]
+    #[tokio::test]
+    async fn s3_without_keys_signs_with_the_host_role() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _env = AWS_ENV.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen_by_server = seen.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let req = String::from_utf8_lossy(&req).to_string();
+                let line = req.lines().next().unwrap_or_default().to_string();
+                let (status, body) = if line.starts_with("PUT /latest/api/token ") {
+                    ("200 OK", "imds-token".to_string())
+                } else if line.starts_with("GET /latest/meta-data/iam/security-credentials/ ") {
+                    ("200 OK", "store-role".to_string())
+                } else if line
+                    .starts_with("GET /latest/meta-data/iam/security-credentials/store-role ")
+                {
+                    let creds = r#"{"AccessKeyId":"ROLEKEYID","SecretAccessKey":"rolesecret","Token":"role-session-token","Expiration":"2099-01-01T00:00:00Z"}"#;
+                    ("200 OK", creds.to_string())
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                seen_by_server.lock().unwrap().push(req);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        std::env::set_var("AWS_METADATA_ENDPOINT", &base);
+        let cfg = crate::tier::TierConfig {
+            kind: crate::tier::TierKind::S3,
+            endpoint: Some(base.clone()),
+            region: Some("us-east-1".into()),
+            bucket: Some("ds-role-test".into()),
+            path_style: true,
+            allow_http: true,
+            ..Default::default()
+        };
+        let bs = S3BlobStore::new(&cfg);
+        std::env::remove_var("AWS_METADATA_ENDPOINT");
+        let bs = bs.expect("build S3 blobstore");
+        let head = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            bs.head("stream-test/0000000000000000"),
+        )
+        .await
+        .expect("head should not hang looking for credentials");
+        server.abort();
+        assert_eq!(head.expect("head"), None);
+
+        let seen = seen.lock().unwrap();
+        let bucket_req = seen
+            .iter()
+            .find(|r| r.starts_with("HEAD /ds-role-test/"))
+            .expect("the bucket was asked for the object");
+        let lower = bucket_req.to_ascii_lowercase();
+        assert!(
+            lower.contains("credential=rolekeyid/"),
+            "signed with the role's key: {bucket_req}"
+        );
+        assert!(
+            lower.contains("x-amz-security-token: role-session-token"),
+            "sent the role's session token: {bucket_req}"
+        );
     }
 }

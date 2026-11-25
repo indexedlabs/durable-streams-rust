@@ -213,6 +213,64 @@ describe(`set-stream-idle-time`, () => {
     }
   })
 
+  it(`skips a stream deleted since the listing without failing the run`, async () => {
+    for (const stream of [`/d.1`, `/d.2`, `/d.3`, `/d.4`]) await createStream(stream, 1)
+    // A fork keeps /d.3 as a tombstone once deleted, which answers 410; /d.2
+    // is removed outright and answers 404.
+    const fork = await fetch(`${baseUrl}/dfork.3`, {
+      method: `PUT`,
+      headers: {
+        'content-type': `application/octet-stream`,
+        'stream-forked-from': `/d.3`,
+        'stream-fork-offset': `now`,
+      },
+    })
+    expect(fork.status).toBe(201)
+    const statuses: Record<string, number> = {}
+    const proxy = createServer(async (req, res) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(chunk as Buffer)
+      if (req.method === `PATCH` && (req.url === `/d.2` || req.url === `/d.3`)) {
+        const deleted = await fetch(`${baseUrl}${req.url}`, { method: `DELETE` })
+        expect(deleted.status, `delete ${req.url}`).toBe(204)
+      }
+      const upstream = await fetch(`${baseUrl}${req.url}`, {
+        method: req.method,
+        headers: req.headers as Record<string, string>,
+        body: chunks.length ? Buffer.concat(chunks) : undefined,
+      })
+      if (req.method === `PATCH`) statuses[req.url ?? ``] = upstream.status
+      res.writeHead(upstream.status, Object.fromEntries(upstream.headers))
+      res.end(Buffer.from(await upstream.arrayBuffer()))
+    })
+    await new Promise<void>((resolve) => proxy.listen(0, `127.0.0.1`, resolve))
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`
+    try {
+      const result = await run([
+        `--base-url`,
+        proxyUrl,
+        `--prefix`,
+        `d.`,
+        `--idle`,
+        `300`,
+        `--commit`,
+        `--rate`,
+        `50`,
+      ])
+      expect(statuses).toEqual({ '/d.1': 204, '/d.2': 404, '/d.3': 410, '/d.4': 204 })
+      expect(result.code, result.stderr).toBe(0)
+      expect(result.stdout).toContain(`skipped (deleted since listing): /d.2`)
+      expect(result.stdout).toContain(`skipped (deleted since listing): /d.3`)
+      expect(result.stdout).toMatch(
+        /\b2 changed, 2 skipped \(deleted since listing\), 0 failed\b/
+      )
+      expect(await idleOf(`/d.1`)).toBe(`300`)
+      expect(await idleOf(`/d.4`)).toBe(`300`)
+    } finally {
+      await new Promise((resolve) => proxy.close(resolve))
+    }
+  })
+
   it(`pages on past a run of soft-deleted streams longer than a page's scan`, async () => {
     // Each parent keeps a fork, so deleting it leaves a tombstone. With one
     // stream a page, a page examines 10 entries; 25 tombstones run past that.

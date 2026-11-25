@@ -9,8 +9,9 @@
 // Without `--commit` it is a dry run: it prints how many streams match and their
 // durable bytes, and sends no PATCH. With `--commit` it PATCHes each stream at
 // `--rate` a second, retries a request that failed in transit or answered 5xx or
-// 429, prints progress, and exits 1 if any stream failed. Running it again is
-// safe: repeating the PATCH changes nothing. Stream paths start with `/`; a
+// 429, prints progress, and exits 1 if any stream failed. A stream deleted since
+// the listing (404 or 410) is skipped, not failed. Running it again is safe:
+// repeating the PATCH changes nothing. Stream paths start with `/`; a
 // prefix without one gets it.
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
@@ -46,12 +47,14 @@ export async function listStreams({ baseUrl, prefix, pageSize = PAGE_SIZE }) {
   return streams
 }
 
-// PATCHes each stream's idle time, starting at most `rate` requests a second.
+// PATCHes each stream's idle time, starting at most `rate` requests a second. A
+// stream that answers 404 or 410 was deleted since the listing and is skipped.
 export async function setIdleTimes({ baseUrl, streams, idle, rate, out = console.log, err = console.error }) {
   const interval = 1000 / rate
   let next = Date.now()
   let lastProgress = Date.now()
   let changed = 0
+  const skipped = []
   const failed = []
   for (const [index, stream] of streams.entries()) {
     const wait = next - Date.now()
@@ -63,6 +66,9 @@ export async function setIdleTimes({ baseUrl, streams, idle, rate, out = console
     })
     if (response?.ok) {
       changed += 1
+    } else if (response?.status === 404 || response?.status === 410) {
+      skipped.push(stream.path)
+      out(`skipped (deleted since listing): ${stream.path}`)
     } else {
       const reason = `${describe(response, error)} after ${attempts} attempt${attempts === 1 ? `` : `s`}`
       failed.push({ path: stream.path, reason })
@@ -70,10 +76,12 @@ export async function setIdleTimes({ baseUrl, streams, idle, rate, out = console
     }
     if (Date.now() - lastProgress >= PROGRESS_EVERY_MS) {
       lastProgress = Date.now()
-      out(`progress: ${index + 1}/${streams.length}, ${changed} changed, ${failed.length} failed`)
+      out(
+        `progress: ${index + 1}/${streams.length}, ${changed} changed, ${skipped.length} skipped (deleted since listing), ${failed.length} failed`
+      )
     }
   }
-  return { changed, failed }
+  return { changed, skipped, failed }
 }
 
 export async function main(argv) {
@@ -99,8 +107,10 @@ export async function main(argv) {
     return 0
   }
   console.log(`setting Stream-Tier-After-Idle: ${idle} at ${rate} a second`)
-  const { changed, failed } = await setIdleTimes({ baseUrl, streams, idle, rate })
-  console.log(`done: ${changed} changed, ${failed.length} failed of ${plural(streams.length, `stream`)}`)
+  const { changed, skipped, failed } = await setIdleTimes({ baseUrl, streams, idle, rate })
+  console.log(
+    `done: ${changed} changed, ${skipped.length} skipped (deleted since listing), ${failed.length} failed of ${plural(streams.length, `stream`)}`
+  )
   return failed.length ? 1 : 0
 }
 

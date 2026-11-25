@@ -356,6 +356,13 @@ fn segment_key(prefix: &str, st: &StreamState, logical_start: u64) -> String {
     format!("{prefix}{fname}/{logical_start:016}")
 }
 
+/// Test hook: runs as a compaction reaches its intent write, so a test can
+/// fence the stream inside the pass as a racing DELETE would.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static COMPACTION_INTENT_HOOK: Mutex<Option<Box<dyn Fn(&Arc<StreamState>) + Send>>> =
+    Mutex::new(None);
+
 /// Suffix of a stream incarnation's pending tier-delete note, kept beside its
 /// `.meta` sidecar as `<data file>.tier-delete`.
 pub(crate) const TIER_DELETE_NOTE_SUFFIX: &str = ".tier-delete";
@@ -580,6 +587,10 @@ impl Store {
             .map_err(std::io::Error::other)??;
         }
 
+        #[cfg(test)]
+        if let Some(hook) = COMPACTION_INTENT_HOOK.lock().unwrap().as_ref() {
+            hook(st);
+        }
         // 2) Persist the compaction intent BEFORE the destructive rename, so a
         //    crash anywhere after this is recoverable (tail is frozen).
         *st.compaction.lock().unwrap() = Some(crate::store::PendingCompaction {
@@ -591,6 +602,16 @@ impl Store {
             tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
                 .await
                 .map_err(std::io::Error::other)??;
+        }
+
+        // A fence that landed during this pass skipped that write: stop before
+        // the rename, or the sidecar's `file_base` would no longer match the
+        // live file. A durable intent with the old file intact recovers as a
+        // compaction that never renamed.
+        if st.is_fenced() {
+            *st.compaction.lock().unwrap() = None;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(());
         }
 
         // 3) Atomic content swap, made crash-durable. In-flight readers keep the

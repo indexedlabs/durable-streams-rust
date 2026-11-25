@@ -4863,6 +4863,53 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fence that lands inside a compaction pass, after its entry check,
+    /// makes the intent write a no-op: the pass must stop before the rename,
+    /// leaving the live file and `file_base` as the sidecar records them.
+    #[tokio::test]
+    async fn compaction_stops_when_the_fence_lands_inside_the_pass() {
+        let dir = tmp_dir("compact-fenced-inside");
+        let (file_path, live_len) = {
+            let mut cfg = local_tier(&dir, 64 * 1024);
+            cfg.compact_bytes = 0;
+            let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+            let (st, _) = offloaded_stream(&store, "s/compact-race", octet_cfg()).await;
+            let len = std::fs::metadata(&st.file_path).unwrap().len();
+            (st.file_path.clone(), len)
+        };
+
+        let mut cfg = local_tier(&dir, 64 * 1024);
+        cfg.compact_bytes = 64 * 1024;
+        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let st = store.get("s/compact-race").expect("stream recovered");
+        let file_base = st.shared.read().unwrap().file_base;
+        let target = Arc::clone(&st);
+        *crate::tier::COMPACTION_INTENT_HOOK.lock().unwrap() =
+            Some(Box::new(move |racing: &Arc<StreamState>| {
+                if Arc::ptr_eq(racing, &target) {
+                    racing
+                        .fenced
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }));
+
+        store.maybe_seal(&st).await;
+        *crate::tier::COMPACTION_INTENT_HOOK.lock().unwrap() = None;
+        assert!(
+            st.is_fenced(),
+            "the compaction pass never reached its intent"
+        );
+        assert_eq!(
+            std::fs::metadata(&file_path).unwrap().len(),
+            live_len,
+            "the live file was renamed after the fence"
+        );
+        assert_eq!(st.shared.read().unwrap().file_base, file_base);
+        assert!(st.compaction.lock().unwrap().is_none());
+        assert!(!file_path.with_extension("compact.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaper's retirement of an expired stream with bytes in the remote
     /// tier removes its local state and its objects and leaves no note.
     #[tokio::test]

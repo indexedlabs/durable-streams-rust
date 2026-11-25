@@ -196,7 +196,7 @@ flowchart TB
     TAIL["active tail<br/>(unsealed, in the data file)"]
     SEG2["sealed segment N<br/>(local chunk file, pending upload)"]
   end
-  subgraph COLD["Cold tier (S3-compatible: R2 / Tigris / MinIO / B2)"]
+  subgraph COLD["Cold tier (S3 / MinIO; other S3-compatible endpoints unverified, see README)"]
     OBJ0[("segment 0")]
     OBJ1[("segment 1")]
   end

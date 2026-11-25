@@ -342,12 +342,17 @@ Hard retirement of a stream with sealed segments first writes a durable
 pending-delete note (`<data file>.tier-delete`, beside its sidecar) naming the
 incarnation's object keys, then unlinks the sidecar and data file. The remote
 deletes still run in a detached task (`gc_remote_segments`), which clears the
-note once every object is gone and keeps it when one fails. Recovery treats a
-note as a delete in progress: it removes that incarnation's sidecar and data
-file before rebuilding streams, reserves its filename ID, and
-`finish_pending_tier_deletes` deletes its objects and clears the note before
-the store serves. Startup therefore accepts proactive `delete` with
-`--tier s3`.
+note once every object is gone. It keeps the note when a delete fails, and when
+a seal/offload pass is still running after its bounded wait, since that pass
+could still land an upload. A stream fenced for retirement seals and uploads
+nothing more: its sidecar writes are skipped, so nothing on disk would list
+the result. Recovery treats a note as a delete in progress: it removes that
+incarnation's sidecar and data file before rebuilding streams and reserves its
+filename ID. Before the store serves, `finish_pending_tier_deletes` deletes each
+note's objects and clears it, with one `recovery:` line per note. It stops at
+the first object delete that fails, keeps that note and the ones after it for
+the next start, and the store serves; a note it cannot read is skipped and
+kept. Startup therefore accepts proactive `delete` with `--tier s3`.
 
 ## Scanner and operating modes
 

@@ -4601,6 +4601,77 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A note that cannot be parsed is a local, permanent error: startup skips
+    /// it, keeps it on disk, and still finishes the notes after it.
+    #[tokio::test]
+    async fn startup_skips_an_unreadable_tier_delete_note() {
+        let dir = tmp_dir("note-unreadable");
+        let (bad, good, good_name) = {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            let mut notes = Vec::new();
+            for path in ["s/bad", "s/good"] {
+                let (st, _) = offloaded_stream(&store, path, octet_cfg()).await;
+                assert!(store.record_tier_delete(&st).unwrap());
+                notes.push((
+                    crate::tier::tier_delete_note_path(&st.file_path),
+                    file_name_of(&st),
+                ));
+            }
+            std::fs::write(&notes[0].0, b"{not a note").unwrap();
+            (notes[0].0.clone(), notes[1].0.clone(), notes[1].1.clone())
+        };
+
+        let store2 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        store2.finish_pending_tier_deletes().await;
+        assert!(bad.exists(), "an unreadable note was removed");
+        assert!(
+            !good.exists(),
+            "the note after an unreadable one was not finished"
+        );
+        assert_eq!(
+            objects_of(&dir, &good_name),
+            0,
+            "its objects were not deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once a stream is fenced for retirement its sidecar writes are skipped,
+    /// so a seal pass that runs after the fence must neither seal nor upload:
+    /// nothing on disk would list what it made.
+    #[tokio::test]
+    async fn seal_pass_after_the_retirement_fence_uploads_nothing() {
+        let dir = tmp_dir("seal-after-fence");
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let st = match store.create("s/fenced", octet_cfg(), None, 0).unwrap() {
+            CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        // Several full segments, all still unsealed.
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        assert_eq!(store.prepare_delete(&st).await, PrepareRetirement::Ready);
+        assert!(st.is_fenced());
+
+        store.maybe_seal(&st).await;
+        assert_eq!(
+            objects_of(&dir, &file_name_of(&st)),
+            0,
+            "objects uploaded after the fence"
+        );
+        assert!(
+            st.tier.manifest.lock().unwrap().segments.is_empty(),
+            "segments sealed after the fence"
+        );
+        assert!(files_under(&dir.join("segments")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaper's retirement of an expired stream with bytes in the remote
     /// tier removes its local state and its objects and leaves no note.
     #[tokio::test]

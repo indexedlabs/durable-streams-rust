@@ -7,10 +7,13 @@
 - Record a tiered stream's object deletes before making them. Deleting a stream
   with pieces in the remote tier, by request or by expiry, writes a durable
   `<data file>.tier-delete` note of its object keys before anything is removed,
-  and clears it once the objects are gone; startup finishes every note a crash
-  left before serving, so a crash leaves neither unlisted objects nor a sidecar
-  listing deleted ones. `--expiry-reaper-mode delete` is now accepted with
-  `--tier s3`.
+  and clears it once the objects are gone. A note stays when an object delete
+  fails or an upload is still running. Before serving, startup finishes the
+  notes left behind; it stops at the first object delete that fails, keeps that
+  note and the ones after it for the next start, and serves. A stream fenced for
+  retirement seals and uploads nothing more. So a crash leaves neither unlisted
+  objects nor a sidecar listing deleted ones, and `--expiry-reaper-mode delete`
+  is now accepted with `--tier s3`.
 
 - Add an offline `prune` subcommand that removes one tenant's streams and
   subscriptions from a stopped store, chosen by each sidecar's recorded path,

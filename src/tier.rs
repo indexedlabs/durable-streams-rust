@@ -399,6 +399,13 @@ fn write_tier_delete_note(path: &std::path::Path, note: &TierDeleteNote) -> std:
     crate::store::fsync_parent_dir(path)
 }
 
+/// The object keys a pending tier-delete note names.
+async fn read_tier_delete_note(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let bytes = tokio::fs::read(path).await?;
+    let note: TierDeleteNote = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    Ok(note.keys)
+}
+
 /// Clear a note once its deletes are done. Its stream's sidecar and data file
 /// share its directory: fsync it first, so a crash can never bring back a
 /// sidecar that lists deleted objects with no note left to finish it.
@@ -647,8 +654,10 @@ impl Store {
             let sealed_offset = {
                 let m = st.tier.manifest.lock().unwrap();
                 // Hard delete arrived mid-pass: stop staging/uploading and let
-                // `gc_remote_segments` reclaim from here.
-                if m.deleted {
+                // `gc_remote_segments` reclaim from here. A fenced stream's
+                // sidecar writes are skipped, so a segment sealed now would be
+                // listed nowhere on disk: stop at the fence too.
+                if m.deleted || st.is_fenced() {
                     return Ok(());
                 }
                 m.sealed_offset.max(st.base_offset)
@@ -773,8 +782,11 @@ impl Store {
         };
         // Hard delete arrived: don't upload an object the GC pass would have to
         // chase (it deletes by deterministic key, but skipping the put avoids the
-        // orphan window entirely).
-        if st.tier.manifest.lock().unwrap().deleted {
+        // orphan window entirely). Nor once the stream is fenced: its sidecar
+        // writes are skipped from then on, so an object uploaded now may be
+        // listed nowhere on disk. A fence is never lifted, so an unfenced stream
+        // here means the sidecar write listing this segment was really made.
+        if st.is_fenced() || st.tier.manifest.lock().unwrap().deleted {
             return Ok(());
         }
         let key = segment_key(&self.tier_config.key_prefix, st, seg_start);
@@ -865,12 +877,26 @@ impl Store {
             );
             return;
         };
-        // Stop at the first failure: an unreachable bucket fails every note,
-        // each only after the client's whole retry budget, and the store is not
-        // serving yet. The failed note and the rest stay for the next start.
+        // Stop at the first failed object delete: an unreachable bucket fails
+        // every note, each only after the client's whole retry budget, and the
+        // store is not serving yet. The failed note and the rest stay for the
+        // next start. A note that cannot be read is a local, permanent error:
+        // skip it (it stays on disk) rather than hold back the notes after it.
         let total = notes.len();
+        let mut finished = 0usize;
         for (i, note) in notes.iter().enumerate() {
-            if let Err(e) = self.finish_tier_delete(bs, note).await {
+            let keys = match read_tier_delete_note(note).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    eprintln!(
+                        "recovery: pending tier delete {}/{total} skipped, its note is unreadable ({e}): {}",
+                        i + 1,
+                        note.display()
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = self.finish_tier_delete(bs, note, &keys).await {
                 eprintln!(
                     "recovery: pending tier delete {}/{total} kept for the next start ({e}), with the {} after it: {}",
                     i + 1,
@@ -879,23 +905,23 @@ impl Store {
                 );
                 return;
             }
+            finished += 1;
             eprintln!(
                 "recovery: pending tier delete {}/{total} finished: {}",
                 i + 1,
                 note.display()
             );
         }
-        eprintln!("recovery: finished {total} pending tier delete(s)");
+        eprintln!("recovery: finished {finished} of {total} pending tier delete(s)");
     }
 
     async fn finish_tier_delete(
         &self,
         bs: &crate::blobstore::SharedBlobStore,
         note_path: &std::path::Path,
+        keys: &[String],
     ) -> std::io::Result<()> {
-        let bytes = tokio::fs::read(note_path).await?;
-        let note: TierDeleteNote = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
-        for key in &note.keys {
+        for key in keys {
             bs.delete(key).await?;
         }
         let data_path = tier_delete_note_data_path(note_path);

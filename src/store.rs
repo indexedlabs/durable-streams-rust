@@ -1025,17 +1025,19 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
-        self.inventory_page_under("", generation, after, limit)
+        self.inventory_page_under("", generation, after, limit, false)
     }
     /// One page of the paths starting with `prefix`, strictly after `after`.
     /// A `generation` fences the page to the inventory version the listing
     /// began at; `None` pages by path alone, so a listing survives writes.
+    /// `live_only` omits soft-deleted streams (tombstones kept for forks).
     pub fn inventory_page_under(
         &self,
         prefix: &str,
         generation: Option<u64>,
         after: Option<&str>,
         limit: usize,
+        live_only: bool,
     ) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
         let inventory = self.inventory.read().unwrap();
         if generation.is_some_and(|generation| generation != inventory.generation) {
@@ -1049,6 +1051,7 @@ impl Store {
             .entries
             .range((start, std::ops::Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(prefix))
+            .filter(|(_, entry)| !(live_only && entry.deleted))
             .take(limit + 1)
             .map(|(_, entry)| entry.clone())
             .collect();

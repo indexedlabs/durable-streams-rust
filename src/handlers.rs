@@ -521,7 +521,8 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
         }
     }
     // A stable listing is fenced to the inventory version its first page
-    // saw; `stable=false` pages on from the cursor's path whatever changed.
+    // saw; `stable=false` pages on from the cursor's path whatever changed,
+    // and lists only streams that exist, never soft-deleted tombstones.
     let (generation, entries, more) = match store.inventory_page_under(
         &prefix,
         cursor
@@ -530,6 +531,7 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
             .map(|(generation, _)| *generation),
         cursor.as_ref().map(|(_, path)| path.as_str()),
         limit,
+        !stable,
     ) {
         Ok(page) => page,
         Err(crate::store::InventoryPageError::GenerationChanged) => {

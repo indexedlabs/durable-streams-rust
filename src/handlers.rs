@@ -5668,10 +5668,10 @@ mod tier_live_reader_tests {
         (0..len).map(|i| b'a' + (i % 26) as u8).collect()
     }
 
-    /// Seal, upload and compact until every sealed byte is only in the bucket.
-    /// Loops because an append may have started a background pass that holds
-    /// the stream's seal guard.
-    async fn seal_into_bucket(store: &Arc<Store>, st: &Arc<StreamState>) -> u64 {
+    /// Seal, upload and compact until every sealed byte is only in the bucket
+    /// and the live file starts above `above`. Loops because an append may have
+    /// started a background pass that holds the stream's seal guard.
+    async fn seal_into_bucket(store: &Arc<Store>, st: &Arc<StreamState>, above: u64) -> u64 {
         for _ in 0..200 {
             store.maybe_seal(st).await;
             let (sealed, all_remote) = {
@@ -5680,7 +5680,7 @@ mod tier_live_reader_tests {
                 (m.sealed_offset, all_remote && !m.offloading)
             };
             let file_base = st.shared.read().unwrap().file_base;
-            if sealed > 0 && all_remote && file_base == sealed {
+            if file_base > above && all_remote && file_base == sealed {
                 return sealed;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5729,6 +5729,59 @@ mod tier_live_reader_tests {
         }
     }
 
+    /// Hand a real socket to the reactor, as `engine_raw` does, and return the
+    /// client end.
+    async fn reactor_subscriber(resp: &Resp, reg: crate::api::SseReg) -> std::net::TcpStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        crate::http1::write_head(&mut head, resp.status, &resp.headers, None, true);
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        crate::sse_reactor::register(server, head, reg, permit);
+        client
+    }
+
+    /// Read from `client` until the reactor closes it.
+    fn read_to_close(client: &mut std::net::TcpStream) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "reactor never closed the subscriber; got {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+            match client.read(&mut buf) {
+                Ok(0) => return seen,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("read from reactor subscriber: {e}"),
+            }
+        }
+    }
+
+    /// The payloads of every `data` event in the raw (chunk-framed) bytes a
+    /// reactor subscriber received, in order.
+    fn reactor_data(seen: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(seen);
+        text.split("event: data\ndata:")
+            .skip(1)
+            .map(|rest| rest.split('\n').next().unwrap().to_string())
+            .collect()
+    }
+
     #[tokio::test]
     async fn sse_tail_reader_on_stream_with_no_s3_bytes_registers_with_reactor() {
         let _durability = test_support::DurabilityGuard::memory();
@@ -5756,7 +5809,7 @@ mod tier_live_reader_tests {
         create(&store, "t/cold").await;
         append(&store, "t/cold", &payload(5000)).await;
         let st = store.streams.get("t/cold").unwrap().clone();
-        let sealed = seal_into_bucket(&store, &st).await;
+        let sealed = seal_into_bucket(&store, &st, 0).await;
 
         // A reader starting at or after the sealed offset needs no S3 bytes.
         assert!(reactor_reg(&sse(&store, "t/cold", sealed).await).is_some());
@@ -5766,26 +5819,85 @@ mod tier_live_reader_tests {
             .expect("a tail reader on a stream with S3 bytes must register with the reactor");
         assert_eq!(reg.start, tail);
 
-        // Hand a real socket to the reactor, as `engine_raw` does, and check the
-        // subscriber receives the next append.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let mut head = Vec::new();
-        crate::http1::write_head(&mut head, resp.status, &resp.headers, None, true);
-        let permit = Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .unwrap();
-        crate::sse_reactor::register(server, head, reg, permit);
-
+        // The subscriber receives the next append.
+        let mut client = reactor_subscriber(&resp, reg).await;
         let mut seen = Vec::new();
         read_until(&mut client, &mut seen, "\"upToDate\":true");
         append(&store, "t/cold", b"NEXT-APPEND").await;
         read_until(&mut client, &mut seen, "data:NEXT-APPEND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The idle pass seals and compacts under live readers. A caught-up reactor
+    /// subscriber keeps reading the swapped live file; a registration whose
+    /// start the cut overtook (the gate ran before the compaction, the reactor
+    /// inserted it after) gets only the terminating chunk, never wrong bytes.
+    /// A woken subscriber always reads up to the tail, so that race is the only
+    /// way one is left behind the cut.
+    #[tokio::test]
+    async fn sse_reactor_subscribers_across_a_compaction() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("compaction");
+        let store = tiered_store(&dir);
+        create(&store, "t/compact").await;
+        append(&store, "t/compact", &payload(5000)).await;
+        let st = store.streams.get("t/compact").unwrap().clone();
+        seal_into_bucket(&store, &st, 0).await;
+
+        let start = st.tail().bytes;
+        let resp = sse(&store, "t/compact", start).await;
+        let reg = reactor_reg(&resp).expect("a tail reader registers with the reactor");
+        let mut caught_up = reactor_subscriber(&resp, reg).await;
+        let mut seen = Vec::new();
+        read_until(&mut caught_up, &mut seen, "\"upToDate\":true");
+        // Passed the gate at the same offset, but not yet inserted.
+        let behind_resp = sse(&store, "t/compact", start).await;
+        let behind = reactor_reg(&behind_resp).expect("the gate admits it before the cut");
+
+        // Bytes the subscriber reads from the old live file.
+        let big = "B".repeat(3000);
+        append(&store, "t/compact", big.as_bytes()).await;
+        let after_big = st.tail().bytes;
+        read_until(
+            &mut caught_up,
+            &mut seen,
+            &format!("\"streamNextOffset\":\"{}\"", format_offset(after_big)),
+        );
+
+        // Seal and compact past both subscribers' start.
+        let old_file = st.shared.read().unwrap().file.clone();
+        let file_base = seal_into_bucket(&store, &st, start).await;
+        assert!(
+            file_base > start,
+            "the cut must overtake the registered start"
+        );
+        assert!(
+            !Arc::ptr_eq(&old_file, &st.shared.read().unwrap().file),
+            "compaction must have swapped the live file"
+        );
+
+        // The caught-up subscriber gets the next append from the new file.
+        append(&store, "t/compact", b"AFTER-COMPACTION").await;
+        read_until(&mut caught_up, &mut seen, "data:AFTER-COMPACTION\n");
+        assert_eq!(
+            reactor_data(&seen).concat(),
+            format!("{big}AFTER-COMPACTION"),
+            "the caught-up subscriber receives exactly the appended bytes"
+        );
+
+        // The overtaken registration is ended cleanly, with no data.
+        let mut lagging = reactor_subscriber(&behind_resp, behind).await;
+        let got = read_to_close(&mut lagging);
+        assert!(
+            reactor_data(&got).is_empty(),
+            "a subscriber behind the cut must get no bytes; got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert!(
+            got.ends_with(b"0\r\n\r\n"),
+            "a subscriber behind the cut gets the terminating chunk; got {:?}",
+            String::from_utf8_lossy(&got)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5798,7 +5910,7 @@ mod tier_live_reader_tests {
         let bytes = payload(5000);
         append(&store, "t/catch-up", &bytes).await;
         let st = store.streams.get("t/catch-up").unwrap().clone();
-        let sealed = seal_into_bucket(&store, &st).await;
+        let sealed = seal_into_bucket(&store, &st, 0).await;
 
         assert!(
             reactor_reg(&sse(&store, "t/catch-up", sealed - 1).await).is_none(),
@@ -5839,9 +5951,10 @@ mod tier_live_reader_tests {
         create(&store, "t/long-poll").await;
         append(&store, "t/long-poll", &payload(5000)).await;
         let st = store.streams.get("t/long-poll").unwrap().clone();
-        seal_into_bucket(&store, &st).await;
+        seal_into_bucket(&store, &st, 0).await;
 
         let tail = st.tail().bytes;
+        let receivers = st.tail_tx.receiver_count();
         let waiter = {
             let store = Arc::clone(&store);
             let query = Some(format!("live=long-poll&offset={}", format_offset(tail)));
@@ -5849,7 +5962,13 @@ mod tier_live_reader_tests {
                 async move { handle(store, req(Method::Get, "t/long-poll", query, b"")).await },
             )
         };
-        tokio::task::yield_now().await;
+        // The handler subscribes to the tail only on its wait path, so a new
+        // receiver proves the request parked before the append.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.tail_tx.receiver_count() == receivers {
+            assert!(Instant::now() < deadline, "the long-poll never parked");
+            tokio::task::yield_now().await;
+        }
         append(&store, "t/long-poll", b"NEXT-APPEND").await;
         let resp = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await

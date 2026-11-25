@@ -3318,7 +3318,12 @@ mod bug1_tests {
 
     struct TestBlob(Mode);
     impl BlobStore for TestBlob {
-        fn put<'a>(&'a self, _k: &'a str, _b: bytes::Bytes) -> BoxFuture<'a, std::io::Result<()>> {
+        fn put<'a>(
+            &'a self,
+            _k: &'a str,
+            _b: bytes::Bytes,
+            _d: crate::blobstore::Sha256Digest,
+        ) -> BoxFuture<'a, std::io::Result<()>> {
             Box::pin(async { Ok(()) })
         }
         fn get_range<'a>(

@@ -5584,7 +5584,7 @@ mod tier_live_reader_tests {
     //! from the resident tail / live file. Only a read that starts below the
     //! sealed offset takes the cold path, which returns the S3 bytes first.
     use super::*;
-    use crate::api::{EventSource, Method, Req};
+    use crate::api::{Method, Req};
     use crate::store::Store;
     use crate::tier::{TierConfig, TierKind};
     use bytes::Bytes;

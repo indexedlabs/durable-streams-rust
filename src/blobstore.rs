@@ -12,10 +12,11 @@
 //   - `S3BlobStore` — an S3-compatible adapter over the `object_store` crate,
 //     behind the `tier` Cargo feature, via custom endpoint + path-style
 //     addressing. Every put sends `x-amz-checksum-sha256`, so supported
-//     endpoints are those known to accept it: AWS S3 and MinIO. R2, Tigris and
-//     B2 are unverified with the checksum; an endpoint that rejects it fails
-//     every upload and leaves each piece local. Only compiled with
-//     `--features tier`.
+//     endpoints are those known to accept it: AWS S3 (production) and MinIO
+//     (its source implements the S3 additional checksums; not run by us). CI's
+//     local S3 server (moto) accepts the header. R2, Tigris and B2 are
+//     unverified with the checksum; an endpoint that rejects it fails every
+//     upload and leaves each piece local. Only compiled with `--features tier`.
 //
 // The trait uses explicitly-boxed futures rather than the `async_trait` macro so
 // the default build pulls in no extra proc-macro dependency.
@@ -199,9 +200,11 @@ mod s3 {
     /// An S3-compatible BlobStore over `object_store`. Configured with a custom
     /// endpoint + path-style addressing. Each put carries `x-amz-checksum-sha256`
     /// and the endpoint must verify it, so only endpoints known to accept that
-    /// header are supported: AWS S3 and MinIO. Cloudflare R2, Fly/Tigris and
-    /// Backblaze B2 are unverified with it; one that rejects it refuses every
-    /// upload, which leaves each piece local (never lost).
+    /// header are supported: AWS S3 (production) and MinIO (its source
+    /// implements the S3 additional checksums; not run by us). CI's local S3
+    /// server (moto) accepts it. Cloudflare R2, Fly/Tigris and Backblaze B2 are
+    /// unverified with it; one that rejects it refuses every upload, which
+    /// leaves each piece local (never lost).
     pub struct S3BlobStore {
         inner: object_store::aws::AmazonS3,
     }

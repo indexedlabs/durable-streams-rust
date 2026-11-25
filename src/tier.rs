@@ -708,8 +708,10 @@ impl Store {
         }
         let key = segment_key(&self.tier_config.key_prefix, st, seg_start);
         let len = payload.len() as u64;
-        // Upload.
-        bs.put(&key, payload).await?;
+        // Upload with the SHA-256 of the bytes as held locally; the object store
+        // refuses the piece if what it received differs.
+        let sha256 = crate::blobstore::sha256_of(&payload);
+        bs.put(&key, payload, sha256).await?;
         // Verify size before we ever delete the local copy.
         match bs.head(&key).await? {
             Some(sz) if sz == len => {}
@@ -882,7 +884,8 @@ impl TierTask {
             };
             let key = segment_key(&self.tier_config.key_prefix, st, start);
             let len = payload.len() as u64;
-            if bs.put(&key, payload).await.is_err() {
+            let sha256 = crate::blobstore::sha256_of(&payload);
+            if bs.put(&key, payload, sha256).await.is_err() {
                 continue;
             }
             if !matches!(bs.head(&key).await, Ok(Some(sz)) if sz == len) {

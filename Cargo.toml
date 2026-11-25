@@ -87,8 +87,10 @@ telemetry = [
     "dep:tracing-opentelemetry",
 ]
 # S3-compatible cold-storage tier (--tier s3). Pulls in `object_store` with its
-# AWS/S3 transport, which works against any S3-compatible endpoint (AWS, R2,
-# Fly/Tigris, MinIO, Backblaze B2) via path-style + custom endpoint config.
+# AWS/S3 transport, via path-style + custom endpoint config. Every upload sends
+# `x-amz-checksum-sha256`, so the endpoint must accept it: AWS S3 and MinIO are
+# the supported endpoints; R2, Fly/Tigris and Backblaze B2 are unverified (see
+# the README's tier section).
 tier = ["dep:object_store"]
 
 [dev-dependencies]

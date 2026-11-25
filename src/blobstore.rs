@@ -9,10 +9,14 @@
 //   - `LocalFsBlobStore` — a chunk directory on local disk. No heavy deps; the
 //     primary use is testing the full seal→offload→read-from-cold path without
 //     standing up S3. Always compiled.
-//   - `S3BlobStore` — a generic S3-compatible adapter over the `object_store`
-//     crate, behind the `tier` Cargo feature. Works against AWS S3, Cloudflare
-//     R2, Fly/Tigris, MinIO, Backblaze B2, etc. via custom endpoint + path-style
-//     addressing. Only compiled with `--features tier`.
+//   - `S3BlobStore` — an S3-compatible adapter over the `object_store` crate,
+//     behind the `tier` Cargo feature, via custom endpoint + path-style
+//     addressing. Every put sends `x-amz-checksum-sha256`, so supported
+//     endpoints are those known to accept it: AWS S3 (production) and MinIO
+//     (its source implements the S3 additional checksums; not run by us). CI's
+//     local S3 server (moto) accepts the header. R2, Tigris and B2 are
+//     unverified with the checksum; an endpoint that rejects it fails every
+//     upload and leaves each piece local. Only compiled with `--features tier`.
 //
 // The trait uses explicitly-boxed futures rather than the `async_trait` macro so
 // the default build pulls in no extra proc-macro dependency.
@@ -21,14 +25,43 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
+
+/// SHA-256 of an object's bytes, taken by the caller from the bytes it holds
+/// locally *before* the upload.
+pub type Sha256Digest = [u8; 32];
+
+/// SHA-256 of `body`.
+pub fn sha256_of(body: &[u8]) -> Sha256Digest {
+    Sha256::digest(body).into()
+}
+
+/// Refuse `body` unless it hashes to `expected`. Used by adapters that cannot
+/// have the object store do it (and by the S3 adapter as a guard on the bytes it
+/// is about to hand to the transport).
+fn check_digest(key: &str, body: &[u8], expected: &Sha256Digest) -> io::Result<()> {
+    if sha256_of(body) != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("blobstore: SHA-256 mismatch for {key}; upload refused"),
+        ));
+    }
+    Ok(())
+}
 
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Object-storage backend for the cold tier. Object keys are opaque strings; the
 /// manifest owns key layout. All methods run off the append hot path.
 pub trait BlobStore: Send + Sync {
-    /// Upload an object in full.
-    fn put<'a>(&'a self, key: &'a str, body: Bytes) -> BoxFuture<'a, io::Result<()>>;
+    /// Upload an object in full. The store verifies `body` against `sha256` and
+    /// refuses the upload, leaving no object under `key`, when they differ.
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: Bytes,
+        sha256: Sha256Digest,
+    ) -> BoxFuture<'a, io::Result<()>>;
     /// Read `[start, start+len)` of an object.
     fn get_range<'a>(
         &'a self,
@@ -79,11 +112,18 @@ impl LocalFsBlobStore {
 }
 
 impl BlobStore for LocalFsBlobStore {
-    fn put<'a>(&'a self, key: &'a str, body: Bytes) -> BoxFuture<'a, io::Result<()>> {
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: Bytes,
+        sha256: Sha256Digest,
+    ) -> BoxFuture<'a, io::Result<()>> {
         let path = self.path_for(key);
+        let key = key.to_owned();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 use std::io::Write;
+                check_digest(&key, &body, &sha256)?;
                 let tmp = path.with_extension("tmp");
                 {
                     let mut f = std::fs::File::create(&tmp)?;
@@ -153,14 +193,18 @@ pub use s3::S3BlobStore;
 #[cfg(feature = "tier")]
 mod s3 {
     use super::*;
-    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, Checksum};
     use object_store::path::Path as ObjPath;
     use object_store::{GetOptions, GetRange, ObjectStore};
 
-    /// A generic S3-compatible BlobStore over `object_store`. Configured with a
-    /// custom endpoint + path-style addressing so it targets any S3-compatible
-    /// provider (AWS, Cloudflare R2, Fly/Tigris, MinIO, Backblaze B2), not just
-    /// AWS.
+    /// An S3-compatible BlobStore over `object_store`. Configured with a custom
+    /// endpoint + path-style addressing. Each put carries `x-amz-checksum-sha256`
+    /// and the endpoint must verify it, so only endpoints known to accept that
+    /// header are supported: AWS S3 (production) and MinIO (its source
+    /// implements the S3 additional checksums; not run by us). CI's local S3
+    /// server (moto) accepts it. Cloudflare R2, Fly/Tigris and Backblaze B2 are
+    /// unverified with it; one that rejects it refuses every upload, which
+    /// leaves each piece local (never lost).
     pub struct S3BlobStore {
         inner: object_store::aws::AmazonS3,
     }
@@ -178,7 +222,12 @@ mod s3 {
             .bucket
             .as_ref()
             .ok_or_else(|| io::Error::other("--tier-bucket is required for --tier s3"))?;
-        let mut b = AmazonS3Builder::new().with_bucket_name(bucket);
+        // S3 checks every put against its SHA-256 (`x-amz-checksum-sha256`) and
+        // refuses a mismatch, so a corrupted upload never becomes the object the
+        // local copy is dropped for.
+        let mut b = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_checksum_algorithm(Checksum::SHA256);
         if let Some(ep) = &cfg.endpoint {
             b = b.with_endpoint(ep.clone());
         }
@@ -214,9 +263,19 @@ mod s3 {
     }
 
     impl BlobStore for S3BlobStore {
-        fn put<'a>(&'a self, key: &'a str, body: Bytes) -> BoxFuture<'a, io::Result<()>> {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: Bytes,
+            sha256: Sha256Digest,
+        ) -> BoxFuture<'a, io::Result<()>> {
             let path = ObjPath::from(key);
             Box::pin(async move {
+                // `object_store` hashes the payload when it sends it and S3
+                // checks that hash. Check the caller's digest here first, so
+                // bytes that changed after the caller hashed them are refused
+                // too.
+                super::check_digest(key, &body, &sha256)?;
                 self.inner
                     .put(&path, body.into())
                     .await
@@ -281,9 +340,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let bs = LocalFsBlobStore::new(dir.clone()).unwrap();
         let key = "stream-abc/0000000000000000";
-        bs.put(key, Bytes::from_static(b"hello world payload"))
-            .await
-            .unwrap();
+        let body = Bytes::from_static(b"hello world payload");
+        bs.put(key, body.clone(), sha256_of(&body)).await.unwrap();
         assert_eq!(bs.head(key).await.unwrap(), Some(19));
         let got = bs.get_range(key, 6, 5).await.unwrap();
         assert_eq!(&got[..], b"world");
@@ -291,6 +349,23 @@ mod tests {
         assert_eq!(bs.head(key).await.unwrap(), None);
         // Idempotent delete.
         bs.delete(key).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_blobstore_refuses_a_digest_mismatch() {
+        let dir = std::env::temp_dir().join(format!("ds-blob-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bs = LocalFsBlobStore::new(dir.clone()).unwrap();
+        let key = "stream-abc/0000000000000001";
+        let digest = sha256_of(b"hello world payload");
+        let err = bs
+            .put(key, Bytes::from_static(b"hello world pAyload"), digest)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(bs.head(key).await.unwrap(), None, "no object left behind");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "no temp file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -321,7 +396,9 @@ mod tests {
         let bs = S3BlobStore::new(&cfg).expect("build S3 blobstore");
         let key = "stream-test/0000000000000042";
         let payload = Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
-        bs.put(key, payload.clone()).await.expect("put");
+        bs.put(key, payload.clone(), sha256_of(&payload))
+            .await
+            .expect("put");
         assert_eq!(
             bs.head(key).await.expect("head"),
             Some(payload.len() as u64)

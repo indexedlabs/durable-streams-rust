@@ -344,9 +344,11 @@ incarnation's object keys, then unlinks the sidecar and data file. The remote
 deletes still run in a detached task (`gc_remote_segments`), which clears the
 note once every object is gone. It keeps the note when a delete fails, and when
 a seal/offload pass is still running after its bounded wait, since that pass
-could still land an upload. A stream fenced for retirement seals and uploads
-nothing more: its sidecar writes are skipped, so nothing on disk would list
-the result. Recovery treats a note as a delete in progress: it removes that
+could still land an upload. A stream fenced for retirement, including a
+recovered soft-deleted fork parent, seals, uploads, unlinks chunks and
+compacts nothing more: its sidecar writes are skipped, so nothing on disk would
+record the result. A chunk whose upload the fence interrupted stays, because the
+sidecar still lists it as local. Recovery treats a note as a delete in progress: it removes that
 incarnation's sidecar and data file before rebuilding streams and reserves its
 filename ID. Before the store serves, `finish_pending_tier_deletes` deletes each
 note's objects and clears it, with one `recovery:` line per note. It stops at

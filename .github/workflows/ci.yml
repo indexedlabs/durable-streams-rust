@@ -44,6 +44,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
+      # The admin scripts' tests start a local store from the binary built above.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Script tests
+        env:
+          RUST_SERVER_BIN: target/release/durable-streams-server
+        run: bun run test:scripts
+
       - name: Upload server binaries
         uses: actions/upload-artifact@v4
         with:

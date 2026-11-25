@@ -12,6 +12,7 @@
   },
   "scripts": {
     "test:conformance": "vitest run --config conformance/vitest.config.ts",
+    "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "sync-version": "node scripts/sync-cargo-version.mjs"
   },
   "devDependencies": {

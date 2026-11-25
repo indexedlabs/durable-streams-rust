@@ -441,6 +441,16 @@ async fn remove_chunk_files(seg_dir: &std::path::Path, file_name: &str) {
     }
 }
 
+/// The key a segment's object is under: the one recorded when it was offloaded,
+/// which outlives a later change of `--tier-key-prefix`, or for a segment not
+/// yet flipped to Remote, the key its upload uses now.
+fn object_key(prefix: &str, st: &StreamState, seg: &SegmentEntry) -> String {
+    match &seg.placement {
+        Placement::Remote(key) => key.clone(),
+        Placement::Local(_) => segment_key(prefix, st, seg.logical_start),
+    }
+}
+
 /// Local staged chunk-file name for a sealed segment.
 fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
     let fname = st
@@ -875,7 +885,7 @@ impl Store {
             m.deleted = true;
             m.segments
                 .iter()
-                .map(|s| segment_key(&self.tier_config.key_prefix, st, s.logical_start))
+                .map(|s| object_key(&self.tier_config.key_prefix, st, s))
                 .collect()
         };
         if keys.is_empty() {
@@ -1017,7 +1027,7 @@ impl Store {
                 let keys = m
                     .segments
                     .iter()
-                    .map(|s| segment_key(&prefix, &st, s.logical_start))
+                    .map(|s| object_key(&prefix, &st, s))
                     .collect();
                 let local = m
                     .segments

@@ -4910,6 +4910,77 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn prefixed_tier(dir: &std::path::Path, key_prefix: &str) -> TierConfig {
+        TierConfig {
+            key_prefix: key_prefix.into(),
+            ..local_tier(dir, 64 * 1024)
+        }
+    }
+
+    /// Objects are deleted under the keys their sidecar recorded, not keys
+    /// rebuilt from today's `--tier-key-prefix`: a store restarted with a new
+    /// prefix still deletes every object a stream offloaded under the old one.
+    /// `crash_after_note` stops after the note and restarts, covering startup.
+    async fn delete_after_a_key_prefix_change(tag: &str, crash_after_note: bool) {
+        let dir = tmp_dir(tag);
+        {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), prefixed_tier(&dir, "old/")).unwrap());
+            offloaded_stream(&store, "s/prefixed", octet_cfg()).await;
+        }
+        let cold = dir.join("cold");
+        assert!(
+            files_under(&cold).iter().all(|n| n.starts_with("old_")),
+            "objects were offloaded under the old prefix ({tag})"
+        );
+        assert!(files_under(&cold).len() >= 2);
+
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), prefixed_tier(&dir, "new/")).unwrap());
+        let st = store.get("s/prefixed").expect("stream recovered");
+        let file_path = st.file_path.clone();
+        let note = crate::tier::tier_delete_note_path(&file_path);
+        if crash_after_note {
+            assert!(store.record_tier_delete(&st).unwrap());
+            drop(st);
+            drop(store);
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), prefixed_tier(&dir, "new/")).unwrap());
+            store.finish_pending_tier_deletes().await;
+        } else {
+            assert_eq!(store.prepare_delete(&st).await, PrepareRetirement::Ready);
+            let step = store
+                .finish_retirement(&store.candidate_for(&st), RetirementDurability::Explicit)
+                .await
+                .unwrap();
+            assert_eq!(step.outcome, RetirementOutcome::Reaped);
+            let mut waited = 0;
+            while (!files_under(&cold).is_empty() || note.exists()) && waited < 300 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                waited += 1;
+            }
+        }
+        assert_eq!(
+            files_under(&cold),
+            Vec::<String>::new(),
+            "objects under the old prefix were left ({tag})"
+        );
+        assert!(!note.exists(), "note not cleared ({tag})");
+        assert!(!file_path.exists(), "data file left ({tag})");
+        assert!(!meta_path(&file_path).exists(), "sidecar left ({tag})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_after_a_key_prefix_change_removes_the_recorded_objects() {
+        delete_after_a_key_prefix_change("prefix-change", false).await;
+    }
+
+    #[tokio::test]
+    async fn startup_after_a_key_prefix_change_removes_the_recorded_objects() {
+        delete_after_a_key_prefix_change("prefix-change-restart", true).await;
+    }
+
     /// The reaper's retirement of an expired stream with bytes in the remote
     /// tier removes its local state and its objects and leaves no note.
     #[tokio::test]

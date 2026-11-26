@@ -155,6 +155,19 @@ jobs:
             --tier-segment-bytes 4096
         run: bun run test:conformance
 
+      # Once more with every stream moving by idle time: a stream unwritten for a
+      # second is moved to the bucket whole, and the suite's later reads and
+      # appends run against streams already in S3.
+      - name: Run conformance (tier-s3, idle pass)
+        env:
+          DS_S3_ACCESS_KEY_ID: test
+          DS_S3_SECRET_ACCESS_KEY: test
+          RUST_SERVER_ARGS: >-
+            --tier s3 --tier-endpoint http://127.0.0.1:9000 --tier-region us-east-1
+            --tier-bucket ds-tier-ci --tier-key-prefix conformance-idle/ --tier-allow-http
+            --tier-segment-bytes 4096 --tier-after-idle-secs 1 --tier-idle-move-rate 1000
+        run: bun run test:conformance
+
       - name: Objects the conformance run offloaded
         if: always()
         env:

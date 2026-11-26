@@ -760,7 +760,8 @@ impl Store {
             let remaining = end - seg_start;
             let is_json = st.is_json;
             let piece = tokio::task::spawn_blocking(move || {
-                read_idle_piece(&file.get()?, file_lo, seg_bytes, remaining, is_json)
+                let file: Arc<std::fs::File> = file.get()?;
+                read_idle_piece(&file, file_lo, seg_bytes, remaining, is_json)
             })
             .await
             .map_err(std::io::Error::other)??;

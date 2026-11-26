@@ -4,6 +4,18 @@
 
 ### Minor Changes
 
+- Move idle streams to the remote tier. With `--tier s3`, a background pass
+  takes each stream unwritten for its idle time (its own
+  `Stream-Tier-After-Idle`, else `--tier-after-idle-secs`) that still has bytes
+  in its data file and does not expire within its next idle time, uploads those
+  bytes in pieces of up to `--tier-segment-bytes` with their SHA-256, lists
+  each piece in the sidecar once the object store accepted it, and then empties
+  the data file at once. Reads keep their offsets and a later append starts a
+  new local tail. A stream with an idle time is no longer sealed by size after
+  an append. New `--tier-idle-move-rate` (default 2 streams a second) paces the
+  pass. Nothing moves unless a stream has an idle time. A piece is at most
+  8 MiB whatever `--tier-segment-bytes` says, so memory stays bounded.
+
 - Record a tiered stream's object deletes before making them. Deleting a stream
   with pieces in the remote tier, by request or by expiry, writes a durable
   `<data file>.tier-delete` note of its object keys before anything is removed,

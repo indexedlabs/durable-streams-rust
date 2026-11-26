@@ -418,6 +418,12 @@ fn main() {
             "--tier-after-idle-secs" => {
                 tier.after_idle_secs = Some(parse_val(args.next(), "--tier-after-idle-secs"));
             }
+            "--tier-idle-move-rate" => {
+                tier.idle_move_rate = parse_val(args.next(), "--tier-idle-move-rate");
+                if tier.idle_move_rate == 0 {
+                    exit_usage("--tier-idle-move-rate must be at least 1");
+                }
+            }
             "--allow-non-loopback-host" => {
                 allow_non_loopback_host = true;
             }
@@ -842,6 +848,10 @@ fn main() {
         // disables only the proactive scanner. Recovery and subscription resume
         // are complete before the scanner can observe or retire anything.
         let mut expiry_reaper = expiry_reaper::spawn(Arc::clone(&store), expiry_reaper);
+        // The idle pass moves streams unwritten for their idle time to the
+        // remote tier. Nothing without `--tier`; nothing moves unless a stream
+        // has an idle time, its own or `--tier-after-idle-secs`.
+        tier::spawn_idle_pass(Arc::clone(&store));
         if let Some(readiness) = &readiness {
             readiness.ready();
         }

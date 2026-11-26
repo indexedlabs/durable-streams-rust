@@ -13,7 +13,9 @@
   the data file at once. Reads keep their offsets and a later append starts a
   new local tail. A stream with an idle time is no longer sealed by size after
   an append. New `--tier-idle-move-rate` (default 2 streams a second) paces the
-  pass. Nothing moves unless a stream has an idle time.
+  pass. Nothing moves unless a stream has an idle time. With `--tier s3`,
+  startup now refuses `--tier-segment-bytes` above 1 GiB, since it is also the
+  idle pass's piece size and a piece is read whole into memory.
 
 - Record a tiered stream's object deletes before making them. Deleting a stream
   with pieces in the remote tier, by request or by expiry, writes a durable

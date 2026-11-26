@@ -563,6 +563,13 @@ fn main() {
     if tier.after_idle_secs.is_some() && tier.kind != tier::TierKind::S3 {
         exit_usage("--tier-after-idle-secs requires --tier s3");
     }
+    if tier.kind == tier::TierKind::S3 && tier.segment_bytes > tier::MAX_SEGMENT_BYTES_WITH_S3 {
+        exit_usage(format!(
+            "--tier-segment-bytes must be at most {} with --tier s3: it is also the idle \
+             pass's piece size, and each piece is read whole into memory",
+            tier::MAX_SEGMENT_BYTES_WITH_S3
+        ));
+    }
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
     // append path with the WAL stage/wait skipped (no splice intercept, no forced

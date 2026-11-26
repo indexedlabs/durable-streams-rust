@@ -462,6 +462,7 @@ fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
 }
 
 /// How fast the idle pass goes.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub struct IdlePace {
     /// Streams checked before each one-second pause.
@@ -470,6 +471,7 @@ pub struct IdlePace {
     pub move_gap: std::time::Duration,
 }
 
+#[cfg(test)]
 impl IdlePace {
     /// No pauses, for tests that drive one pass.
     #[cfg(test)]

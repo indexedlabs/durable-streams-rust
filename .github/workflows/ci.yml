@@ -174,7 +174,11 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
-        run: aws --endpoint-url http://127.0.0.1:9000 s3 ls --recursive --summarize "s3://$DS_S3_BUCKET/conformance/" | tail -3
+        run: |
+          for prefix in conformance/ conformance-idle/; do
+            echo "$prefix"
+            aws --endpoint-url http://127.0.0.1:9000 s3 ls --recursive --summarize "s3://$DS_S3_BUCKET/$prefix" | tail -3
+          done
 
       - name: Local S3 log
         if: failure()

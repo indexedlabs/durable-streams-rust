@@ -672,7 +672,7 @@ impl Store {
             .collect();
         let mut moved = 0;
         for (checked, stream) in streams.iter().enumerate() {
-            if checked > 0 && checked.is_multiple_of(pace.checks_per_sec.max(1)) {
+            if checked > 0 && checked % pace.checks_per_sec.max(1) == 0 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             let Some(st) = stream.upgrade() else {

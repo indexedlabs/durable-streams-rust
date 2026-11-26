@@ -6002,15 +6002,24 @@ mod tier_tests {
 
     /// A restart after a piece was uploaded and before the sidecar listed it,
     /// then a DELETE or an expiry instead of another pass: the delete names
-    /// the unlisted piece's key too, so the bucket ends empty.
+    /// the unlisted piece's key too, so the bucket ends empty. It does so even
+    /// when the stream has since lost its idle time, by a restart without the
+    /// store default or by a `PATCH … default`.
     #[tokio::test]
     async fn delete_and_expiry_after_an_unlisted_upload_remove_it() {
-        for by_expiry in [false, true] {
-            let dir = tmp_dir(if by_expiry { "idle-unlisted-expire" } else { "idle-unlisted-delete" });
+        for case in ["delete", "expiry", "restart-without-default", "patch-default"] {
+            let dir = tmp_dir(&format!("idle-unlisted-{case}"));
+            // The stream's idle time when the piece went up.
+            let (default_idle, own) = if case == "restart-without-default" {
+                (Some(1), None)
+            } else {
+                (None, Some(TierAfterIdle::Secs(1)))
+            };
             let file_name = {
-                let store =
-                    Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
-                let mut cfg = idle_cfg(Some(TierAfterIdle::Secs(1)));
+                let store = Arc::new(
+                    Store::new_with_tier(dir.clone(), idle_tier(&dir, default_idle)).unwrap(),
+                );
+                let mut cfg = idle_cfg(own);
                 cfg.ttl_seconds = Some(3600);
                 let st = idle_stream(&store, "s/unlisted", cfg, &idle_payload(), 10).await;
                 let file_name = file_name_of(&st);
@@ -6024,12 +6033,18 @@ mod tier_tests {
             };
             assert_eq!(objects_of(&dir, &file_name), 1);
 
+            // Restarted with no store default.
             let store =
                 Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
             let st = store.get("s/unlisted").unwrap();
             assert!(st.tier.manifest.lock().unwrap().segments.is_empty());
+            if case == "patch-default" {
+                assert!(set_tier_after_idle_sync(&st, None).unwrap());
+            }
+            let has_idle_time = st.shared.read().unwrap().tier_after_idle.is_some();
+            assert_eq!(has_idle_time, case == "delete" || case == "expiry", "{case}");
             let file_path = st.file_path.clone();
-            if by_expiry {
+            if case == "expiry" {
                 drop(st);
                 expire_stream(&store, "s/unlisted").await;
             } else {
@@ -6039,6 +6054,65 @@ mod tier_tests {
             wait_until_objects_gone(&dir, &file_name, &file_path).await;
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A segment left `Local` whose chunk file is gone does not fail the move
+    /// on every pass: it is skipped and stays listed, the bytes above it are
+    /// moved, and the data file keeps its bytes from that segment's start.
+    #[tokio::test]
+    async fn idle_move_skips_a_local_segment_whose_chunk_file_is_gone() {
+        let dir = tmp_dir("idle-missing-chunk");
+        let switch = Arc::new(SwitchableBlobStore {
+            inner: crate::blobstore::LocalFsBlobStore::new(dir.join("cold")).unwrap(),
+            down: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut store = Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap();
+        let shared: crate::blobstore::SharedBlobStore = switch.clone();
+        store.blobstore = Some(shared);
+        let store = Arc::new(store);
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let st = idle_stream(&store, "s/missing-chunk", idle_cfg(None), &payload, 10).await;
+        store.maybe_seal(&st).await;
+        let (chunk, local_end) = {
+            let m = st.tier.manifest.lock().unwrap();
+            assert_eq!(m.segments.len(), 1);
+            match &m.segments[0].placement {
+                crate::tier::Placement::Local(path) => (path.clone(), m.segments[0].logical_end()),
+                crate::tier::Placement::Remote(_) => panic!("the segment went up"),
+            }
+        };
+        std::fs::remove_file(&chunk).unwrap();
+        switch.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(set_tier_after_idle_sync(&st, Some(TierAfterIdle::Secs(1))).unwrap());
+        age_data_file(&st, 10);
+
+        // Nothing is dropped: the data file still holds the skipped segment.
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 0);
+        {
+            let m = st.tier.manifest.lock().unwrap();
+            assert_eq!(m.sealed_offset, len, "the bytes above it were not moved");
+            assert!(matches!(
+                m.segments[0].placement,
+                crate::tier::Placement::Local(_)
+            ));
+            assert!(m.segments[1..].iter().all(|s| s.remote));
+            assert_eq!(m.segments[1].logical_start, local_end);
+        }
+        assert_eq!(st.shared.read().unwrap().file_base, 0);
+        assert_eq!(data_file_len(&st), len, "the skipped segment's bytes were dropped");
+        // Above it, reads are served from the bucket.
+        assert_eq!(
+            read_logical(&st, local_end, len).await,
+            payload[local_end as usize..].to_vec()
+        );
+
+        // The next pass finds nothing to upload or drop, and does not fail.
+        age_data_file(&st, 10);
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 0);
+        assert_eq!(st.tier.manifest.lock().unwrap().sealed_offset, len);
+        assert_eq!(data_file_len(&st), len);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A fence that lands after the pieces are listed and before the drop

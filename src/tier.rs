@@ -477,21 +477,20 @@ fn object_key(prefix: &str, st: &StreamState, seg: &SegmentEntry) -> String {
 }
 
 /// The key of the one piece the idle pass may have uploaded and not yet
-/// listed: the piece at the sealed offset, when the stream moves by idle time
-/// (`idle_tail` is then its durable tail) and holds durable bytes above that
-/// offset. A crash between that upload and its sidecar write, or a failed
-/// cleanup after a fence, leaves such an object; a delete removes it with the
-/// rest (deleting a key that does not exist is harmless).
+/// listed: the piece at the sealed offset, when the stream holds durable bytes
+/// above it. A crash between that upload and its sidecar write, or a failed
+/// cleanup after a fence, leaves such an object, and the stream may since have
+/// lost its idle time (a restart without the default, a `PATCH … default`); a
+/// delete removes it with the rest (deleting a key that does not exist is
+/// harmless).
 fn unlisted_idle_key(
     prefix: &str,
     st: &StreamState,
     m: &Manifest,
-    idle_tail: Option<u64>,
+    durable_tail: u64,
 ) -> Option<String> {
     let sealed = m.sealed_offset.max(st.base_offset);
-    idle_tail
-        .filter(|tail| *tail > sealed)
-        .map(|_| segment_key(prefix, st, sealed))
+    (durable_tail > sealed).then(|| segment_key(prefix, st, sealed))
 }
 
 /// Local staged chunk-file name for a sealed segment.
@@ -758,7 +757,10 @@ impl Store {
         st: &Arc<StreamState>,
         bs: &crate::blobstore::SharedBlobStore,
     ) -> std::io::Result<Option<u64>> {
-        // Segments an earlier size seal left local; any failure keeps them.
+        // Segments an earlier size seal left local; a failed upload keeps them.
+        // One whose chunk file cannot be read is skipped, as `offload_pending`
+        // skips it, and stays listed `Local`; `drop_moved_bytes` then keeps the
+        // data file from its start.
         let local: Vec<(u64, PathBuf)> = st
             .tier
             .manifest
@@ -772,7 +774,13 @@ impl Store {
             })
             .collect();
         for (start, path) in local {
-            let payload = tokio::fs::read(&path).await?;
+            let payload = match tokio::fs::read(&path).await {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::warn!(stream = %st.path, chunk = %path.display(), error = %e, "tier idle pass: a local segment's chunk file is unreadable; it is skipped");
+                    continue;
+                }
+            };
             self.offload_one(st, start, bytes::Bytes::from(payload)).await?;
         }
         let seg_bytes = self.tier_config.segment_bytes.clamp(1, IDLE_PIECE_MAX);
@@ -782,8 +790,7 @@ impl Store {
             // Separate acquisitions, never nested (see `seal_loop`).
             let seg_start = {
                 let m = st.tier.manifest.lock().unwrap();
-                // `offload_one` leaves a segment local only once fenced or deleted.
-                if m.deleted || st.is_fenced() || m.segments.iter().any(|seg| !seg.remote) {
+                if m.deleted || st.is_fenced() {
                     return Ok(None);
                 }
                 m.sealed_offset.max(st.base_offset)
@@ -881,18 +888,24 @@ impl Store {
         if tail != end {
             return Ok(false);
         }
-        let sealed = st
-            .tier
-            .manifest
-            .lock()
-            .unwrap()
-            .sealed_offset
-            .max(st.base_offset);
-        if sealed <= file_base {
+        // Up to the sealed offset, but never past a segment still `Local` (its
+        // chunk file was unreadable) whose bytes the data file still holds: it
+        // keeps them from there.
+        let cut = {
+            let m = st.tier.manifest.lock().unwrap();
+            let sealed = m.sealed_offset.max(st.base_offset);
+            m.segments
+                .iter()
+                .filter(|seg| !seg.remote && seg.logical_start >= file_base)
+                .map(|seg| seg.logical_start)
+                .min()
+                .map_or(sealed, |start| start.min(sealed))
+        };
+        if cut <= file_base {
             return Ok(false);
         }
-        self.compact_one(st, sealed).await?;
-        Ok(st.shared.read().unwrap().file_base == sealed)
+        self.compact_one(st, cut).await?;
+        Ok(st.shared.read().unwrap().file_base == cut)
     }
 }
 
@@ -1299,10 +1312,10 @@ impl Store {
     /// Durably record the delete of a hard-deleted stream's remote objects
     /// before any of them, or its local state, is removed. Marks the stream
     /// deleted first, under the manifest lock it snapshots under, so no seal or
-    /// offload pass uploads an object the note does not name. For a stream that
-    /// moves by idle time the note also names the one piece the idle pass may
-    /// have uploaded and not yet listed (`unlisted_idle_key`), even when no
-    /// segment is listed. Returns whether a note was written: a stream that never
+    /// offload pass uploads an object the note does not name. For a stream with
+    /// durable bytes above its sealed offset the note also names the one piece
+    /// the idle pass may have uploaded and not yet listed (`unlisted_idle_key`),
+    /// even when no segment is listed. Returns whether a note was written: a stream that never
     /// sealed nor holds such a piece, or a store with no remote tier, has no
     /// object to delete.
     pub(crate) fn record_tier_delete(&self, st: &Arc<StreamState>) -> std::io::Result<bool> {
@@ -1310,9 +1323,7 @@ impl Store {
             return Ok(false);
         }
         // Read before the manifest lock, never nested inside it (see `seal_loop`).
-        let idle_tail = self
-            .moves_by_idle_time(st)
-            .then(|| st.shared.read().unwrap().durable_tail);
+        let durable_tail = st.shared.read().unwrap().durable_tail;
         let keys: Vec<String> = {
             let mut m = st.tier.manifest.lock().unwrap();
             m.deleted = true;
@@ -1321,7 +1332,8 @@ impl Store {
                 .iter()
                 .map(|s| object_key(&self.tier_config.key_prefix, st, s))
                 .collect();
-            if let Some(key) = unlisted_idle_key(&self.tier_config.key_prefix, st, &m, idle_tail) {
+            if let Some(key) = unlisted_idle_key(&self.tier_config.key_prefix, st, &m, durable_tail)
+            {
                 if !keys.contains(&key) {
                     keys.push(key);
                 }
@@ -1439,9 +1451,7 @@ impl Store {
             .unwrap_or("stream")
             .to_string();
         let note = noted.then(|| tier_delete_note_path(&st.file_path));
-        let idle_tail = self
-            .moves_by_idle_time(st)
-            .then(|| st.shared.read().unwrap().durable_tail);
+        let durable_tail = st.shared.read().unwrap().durable_tail;
         let st = st.clone();
         tokio::spawn(async move {
             // Wait out any pass that was already inside its offloading window so we
@@ -1472,7 +1482,7 @@ impl Store {
                     .iter()
                     .map(|s| object_key(&prefix, &st, s))
                     .collect();
-                if let Some(key) = unlisted_idle_key(&prefix, &st, &m, idle_tail) {
+                if let Some(key) = unlisted_idle_key(&prefix, &st, &m, durable_tail) {
                     if !keys.contains(&key) {
                         keys.push(key);
                     }

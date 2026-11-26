@@ -461,6 +461,44 @@ fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
     format!("{fname}.seg.{logical_start:016}")
 }
 
+/// How fast the idle pass goes.
+#[derive(Clone, Copy, Debug)]
+pub struct IdlePace {
+    /// Streams checked before each one-second pause.
+    pub checks_per_sec: usize,
+    /// Pause after each stream moved.
+    pub move_gap: std::time::Duration,
+}
+
+impl IdlePace {
+    /// No pauses, for tests that drive one pass.
+    #[cfg(test)]
+    pub fn unpaced() -> Self {
+        IdlePace {
+            checks_per_sec: usize::MAX,
+            move_gap: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl Store {
+    /// The idle pass: not built yet (the tests come first).
+    #[cfg(test)]
+    pub async fn idle_pass(self: &Arc<Self>, _pace: IdlePace) -> usize {
+        0
+    }
+
+    /// Not built yet (the tests come first).
+    #[cfg(test)]
+    pub(crate) async fn upload_idle_bytes(
+        self: &Arc<Self>,
+        _st: &Arc<StreamState>,
+        _bs: &crate::blobstore::SharedBlobStore,
+    ) -> std::io::Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
 impl Store {
     /// On boot, re-enqueue any sealed-but-not-yet-offloaded segments (placement
     /// still Local while a remote tier is configured) and log hard errors for

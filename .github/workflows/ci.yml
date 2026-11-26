@@ -136,6 +136,7 @@ jobs:
         run: |
           cargo test --release --locked --features tier s3_minio_roundtrip -- --ignored
           cargo test --release --locked --features tier --test cli_durability_guards delete_mode_removes_an_expired_tiered_stream -- --ignored
+          cargo test --release --locked --features tier --test cli_durability_guards idle_pass_moves_an_idle_stream_to_the_bucket -- --ignored
 
       - uses: oven-sh/setup-bun@v2
         with:

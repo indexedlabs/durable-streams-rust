@@ -5317,6 +5317,642 @@ mod tier_tests {
         assert!(store.get("s/expires").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- the idle pass: idle streams move to the remote tier ----
+
+    use crate::tier::IdlePace;
+
+    /// A local tier with 64 KiB pieces and `default_idle` as the store's
+    /// `--tier-after-idle-secs`.
+    fn idle_tier(dir: &std::path::Path, default_idle: Option<u64>) -> TierConfig {
+        TierConfig {
+            after_idle_secs: default_idle,
+            ..local_tier(dir, 64 * 1024)
+        }
+    }
+
+    fn idle_cfg(own: Option<TierAfterIdle>) -> StreamConfig {
+        StreamConfig {
+            tier_after_idle: own,
+            ..octet_cfg()
+        }
+    }
+
+    /// Date a stream's data file back, as if it was last written `secs` ago.
+    fn age_data_file(st: &Arc<StreamState>, secs: u64) {
+        let f = OpenOptions::new().write(true).open(&st.file_path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn data_file_len(st: &Arc<StreamState>) -> u64 {
+        std::fs::metadata(&st.file_path).unwrap().len()
+    }
+
+    /// 200 KiB, more than three 64 KiB pieces.
+    fn idle_payload() -> Vec<u8> {
+        (0..200 * 1024).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Create `path` with `cfg`, append `payload` and date its data file back
+    /// `age_secs`.
+    async fn idle_stream(
+        store: &Arc<Store>,
+        path: &str,
+        cfg: StreamConfig,
+        payload: &[u8],
+        age_secs: u64,
+    ) -> Arc<StreamState> {
+        let st = match store.create(path, cfg, None, 0).unwrap() {
+            CreateResult::Created(s) => s,
+            _ => panic!("create {path} failed"),
+        };
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        age_data_file(&st, age_secs);
+        st
+    }
+
+    /// The stream kept every local byte and nothing of it went to the bucket.
+    fn assert_stayed_local(dir: &std::path::Path, st: &Arc<StreamState>, len: u64) {
+        assert_eq!(data_file_len(st), len, "{}: local bytes dropped", st.path);
+        let m = st.tier.manifest.lock().unwrap();
+        assert!(m.segments.is_empty(), "{}: pieces listed", st.path);
+        assert_eq!(m.sealed_offset, 0, "{}: sealed offset moved", st.path);
+        drop(m);
+        assert_eq!(objects_of(dir, &file_name_of(st)), 0, "{}: uploaded", st.path);
+    }
+
+    /// The stream is wholly in the bucket: an empty data file, every piece
+    /// remote and at most one segment long, and the sealed offset at its tail.
+    fn assert_moved(dir: &std::path::Path, st: &Arc<StreamState>, len: u64) {
+        assert_eq!(data_file_len(st), 0, "{}: data file not empty", st.path);
+        let (file_base, tail) = {
+            let s = st.shared.read().unwrap();
+            (s.file_base, s.tail)
+        };
+        assert_eq!((file_base, tail), (len, len), "{}: offsets", st.path);
+        let m = st.tier.manifest.lock().unwrap();
+        assert_eq!(m.sealed_offset, len, "{}: sealed offset", st.path);
+        assert!(m.segments.iter().all(|s| s.remote && s.len <= 64 * 1024));
+        let mut next = 0;
+        for seg in &m.segments {
+            assert_eq!(seg.logical_start, next, "{}: pieces not contiguous", st.path);
+            next = seg.logical_end();
+        }
+        assert_eq!(next, len, "{}: pieces do not cover the stream", st.path);
+        let pieces = m.segments.len();
+        drop(m);
+        assert_eq!(objects_of(dir, &file_name_of(st)), pieces, "{}", st.path);
+        let chunks = files_under(&dir.join("segments"));
+        assert!(
+            !chunks.iter().any(|n| n.starts_with(&file_name_of(st))),
+            "{}: a local copy of sealed bytes was staged",
+            st.path
+        );
+    }
+
+    /// #v-idle-move: one pass moves a stream whose data file is older than its
+    /// idle time, empties its data file, and reads below, across and above the
+    /// sealed offset return the bytes written. A younger stream, a `never`
+    /// stream and one that expires within its idle time keep their bytes.
+    #[tokio::test]
+    async fn idle_pass_moves_an_idle_stream_and_reads_it_back() {
+        let dir = tmp_dir("idle-move");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let idle = idle_stream(
+            &store,
+            "s/idle",
+            idle_cfg(Some(TierAfterIdle::Secs(1))),
+            &payload,
+            10,
+        )
+        .await;
+        let young = idle_stream(
+            &store,
+            "s/young",
+            idle_cfg(Some(TierAfterIdle::Secs(3600))),
+            &payload,
+            10,
+        )
+        .await;
+        let never = idle_stream(
+            &store,
+            "s/never",
+            idle_cfg(Some(TierAfterIdle::Never)),
+            &payload,
+            30 * 24 * 3600,
+        )
+        .await;
+        let mut expiring_cfg = idle_cfg(Some(TierAfterIdle::Secs(60)));
+        expiring_cfg.ttl_seconds = Some(30);
+        let expiring = idle_stream(&store, "s/expiring", expiring_cfg, &payload, 120).await;
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+
+        assert_moved(&dir, &idle, len);
+        for st in [&young, &never, &expiring] {
+            assert_stayed_local(&dir, st, len);
+            assert_eq!(read_logical(st, 0, len).await, payload);
+        }
+        // Below the sealed offset: from offset 0 and from a middle offset.
+        assert_eq!(read_logical(&idle, 0, len).await, payload);
+        assert_eq!(
+            read_logical(&idle, 100_000, len).await,
+            payload[100_000..].to_vec()
+        );
+        assert!(!all_local(&idle, 0, len), "the bytes are not read from S3");
+
+        // Across and above it, once an append has started a new local tail.
+        let more: Vec<u8> = (0..4096).map(|i| (i % 7) as u8).collect();
+        append_wire(&idle, &more).await;
+        let mut all = payload.clone();
+        all.extend_from_slice(&more);
+        let tail = all.len() as u64;
+        assert_eq!(
+            read_logical(&idle, len - 100, len + 100).await,
+            all[(len - 100) as usize..(len + 100) as usize].to_vec()
+        );
+        assert_eq!(read_logical(&idle, len, tail).await, more);
+        assert!(all_local(&idle, len, tail), "the new tail is local");
+        assert_eq!(read_logical(&idle, 0, tail).await, all);
+
+        // A restart keeps the move: the sidecar lists the pieces and the data
+        // file holds only the new tail.
+        drop((idle, young, never, expiring));
+        drop(store);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let idle = store.get("s/idle").unwrap();
+        assert_eq!(data_file_len(&idle), more.len() as u64);
+        assert_eq!(read_logical(&idle, 0, tail).await, all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pass cuts a JSON stream on value boundaries, and a value longer
+    /// than a piece goes whole into one piece instead of keeping the stream
+    /// local.
+    #[tokio::test]
+    async fn idle_pass_cuts_a_json_stream_on_value_boundaries() {
+        let dir = tmp_dir("idle-json");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let mut cfg = idle_cfg(Some(TierAfterIdle::Secs(1)));
+        cfg.content_type = "application/json".into();
+        let mut wire = Vec::new();
+        for i in 0..3000 {
+            wire.extend_from_slice(format!("{{\"n\":{i},\"s\":\"a,b]\"}},").as_bytes());
+        }
+        wire.extend_from_slice(format!("\"{}\",", "x".repeat(100 * 1024)).as_bytes());
+        for i in 0..100 {
+            wire.extend_from_slice(format!("[{i}],").as_bytes());
+        }
+        let st = idle_stream(&store, "s/json", cfg, &wire, 10).await;
+        let len = wire.len() as u64;
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+
+        assert_eq!(data_file_len(&st), 0);
+        let segments: Vec<(u64, u64)> = {
+            let m = st.tier.manifest.lock().unwrap();
+            assert_eq!(m.sealed_offset, len);
+            m.segments
+                .iter()
+                .map(|s| (s.logical_start, s.len))
+                .collect()
+        };
+        assert!(segments.len() >= 3, "{segments:?}");
+        for (start, seg_len) in &segments {
+            let piece = &wire[*start as usize..(*start + *seg_len) as usize];
+            assert_eq!(
+                crate::tier::last_json_value_boundary(piece, *seg_len),
+                *seg_len,
+                "piece at {start} does not end on a value boundary"
+            );
+        }
+        assert!(
+            segments.iter().any(|(_, l)| *l > 64 * 1024),
+            "the long value was split or left local"
+        );
+        assert_eq!(read_logical(&st, 0, len).await, wire);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #v-idle-time-source: with a store default, a stream with its own
+    /// shorter idle time moves first, one with `never` stays, and one with
+    /// none moves at the default; a changed idle time counts from the next
+    /// pass. With no default, only the stream with its own idle time moves.
+    #[tokio::test]
+    async fn idle_time_comes_from_the_stream_then_the_store_default() {
+        let dir = tmp_dir("idle-source");
+        let store = Arc::new(
+            Store::new_with_tier(dir.clone(), idle_tier(&dir, Some(3600))).unwrap(),
+        );
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let own = idle_stream(
+            &store,
+            "s/own",
+            idle_cfg(Some(TierAfterIdle::Secs(60))),
+            &payload,
+            120,
+        )
+        .await;
+        let never = idle_stream(
+            &store,
+            "s/never",
+            idle_cfg(Some(TierAfterIdle::Never)),
+            &payload,
+            30 * 24 * 3600,
+        )
+        .await;
+        let by_default = idle_stream(&store, "s/default", idle_cfg(None), &payload, 120).await;
+        let patched = idle_stream(&store, "s/patched", idle_cfg(None), &payload, 120).await;
+        // A PATCH gives it its own shorter idle time: the pass reads the
+        // current value, not the one it was created with.
+        assert!(set_tier_after_idle_sync(&patched, Some(TierAfterIdle::Secs(60))).unwrap());
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 2);
+        assert_moved(&dir, &own, len);
+        assert_moved(&dir, &patched, len);
+        assert_stayed_local(&dir, &never, len);
+        assert_stayed_local(&dir, &by_default, len);
+
+        // Older than the default now.
+        age_data_file(&by_default, 7200);
+        age_data_file(&never, 31 * 24 * 3600);
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_moved(&dir, &by_default, len);
+        assert_stayed_local(&dir, &never, len);
+        for st in [&own, &patched, &by_default, &never] {
+            assert_eq!(read_logical(st, 0, len).await, payload);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = tmp_dir("idle-source-no-default");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let own = idle_stream(
+            &store,
+            "s/own",
+            idle_cfg(Some(TierAfterIdle::Secs(60))),
+            &payload,
+            120,
+        )
+        .await;
+        let none = idle_stream(&store, "s/none", idle_cfg(None), &payload, 30 * 24 * 3600).await;
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_moved(&dir, &own, len);
+        assert_stayed_local(&dir, &none, len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #v-interrupted-move, first half: a restart after a piece was uploaded
+    /// and before the sidecar listed it. The next pass uploads the piece again
+    /// under the same key, replacing what is there.
+    #[tokio::test]
+    async fn restart_after_an_upload_before_its_sidecar_write_uploads_it_again() {
+        let dir = tmp_dir("idle-crash-upload");
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let file_name = {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+            let st = idle_stream(
+                &store,
+                "s/crash",
+                idle_cfg(Some(TierAfterIdle::Secs(1))),
+                &payload,
+                10,
+            )
+            .await;
+            // What the interrupted pass left under the first piece's key: an
+            // object no sidecar lists (here a short one, so a reuse would show).
+            let file_name = file_name_of(&st);
+            let bs = store.blobstore.clone().unwrap();
+            let stale = bytes::Bytes::from_static(b"left by the interrupted pass");
+            let digest = crate::blobstore::sha256_of(&stale);
+            bs.put(&format!("{file_name}/{:016}", 0), stale, digest)
+                .await
+                .unwrap();
+            file_name
+        };
+
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let st = store.get("s/crash").unwrap();
+        assert_eq!(file_name_of(&st), file_name);
+        assert!(st.tier.manifest.lock().unwrap().segments.is_empty());
+        assert_eq!(data_file_len(&st), len, "the bytes are still local");
+        age_data_file(&st, 10);
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_moved(&dir, &st, len);
+        assert_eq!(read_logical(&st, 0, len).await, payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blobstore that counts every request made of it.
+    struct CountingBlobStore {
+        inner: crate::blobstore::LocalFsBlobStore,
+        puts: std::sync::atomic::AtomicUsize,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingBlobStore {
+        fn new(dir: &std::path::Path) -> Self {
+            CountingBlobStore {
+                inner: crate::blobstore::LocalFsBlobStore::new(dir.join("cold")).unwrap(),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::blobstore::BlobStore for CountingBlobStore {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: bytes::Bytes,
+            sha256: crate::blobstore::Sha256Digest,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(key, body, sha256)
+        }
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            start: u64,
+            len: u64,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_range(key, start, len)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.head(key)
+        }
+        fn delete<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.delete(key)
+        }
+    }
+
+    /// #v-interrupted-move, second half: a restart after the sidecar listed
+    /// the pieces and before the local bytes were dropped leaves both; reads
+    /// are exact, and the next pass drops the local bytes without uploading
+    /// anything again.
+    #[tokio::test]
+    async fn restart_after_the_sidecar_write_before_the_drop_drops_on_the_next_pass() {
+        let dir = tmp_dir("idle-crash-drop");
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+            let st = idle_stream(
+                &store,
+                "s/crash",
+                idle_cfg(Some(TierAfterIdle::Secs(1))),
+                &payload,
+                10,
+            )
+            .await;
+            let bs = store.blobstore.clone().unwrap();
+            // The pass up to its sidecar write, then a crash.
+            assert_eq!(store.upload_idle_bytes(&st, &bs).await.unwrap(), Some(len));
+            assert_eq!(data_file_len(&st), len);
+        }
+
+        let mut store = Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap();
+        let counting = Arc::new(CountingBlobStore::new(&dir));
+        store.blobstore = Some(counting.clone());
+        let store = Arc::new(store);
+        let st = store.get("s/crash").unwrap();
+        // Both copies: the sidecar lists every piece and the data file is whole.
+        {
+            let m = st.tier.manifest.lock().unwrap();
+            assert_eq!(m.sealed_offset, len);
+            assert!(!m.segments.is_empty() && m.segments.iter().all(|s| s.remote));
+        }
+        assert_eq!(data_file_len(&st), len);
+        assert_eq!(read_logical(&st, 0, len).await, payload);
+        age_data_file(&st, 10);
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_eq!(
+            counting.puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "listed pieces were uploaded again"
+        );
+        assert_moved(&dir, &st, len);
+        assert_eq!(read_logical(&st, 0, len).await, payload);
+
+        // And the drop itself survives a restart.
+        drop(st);
+        drop(store);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+        let st = store.get("s/crash").unwrap();
+        assert_moved(&dir, &st, len);
+        assert_eq!(read_logical(&st, 0, len).await, payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #v-s3-outage: with the object store unreachable a pass changes no
+    /// sidecar and drops nothing, appends and local reads succeed, and a read
+    /// of bytes already in S3 fails instead of returning a short answer.
+    #[tokio::test]
+    async fn s3_outage_moves_nothing_and_local_streams_read_and_write() {
+        let dir = tmp_dir("idle-outage");
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        // A stream already in S3 from before the outage.
+        {
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap());
+            idle_stream(
+                &store,
+                "s/cold",
+                idle_cfg(Some(TierAfterIdle::Secs(1))),
+                &payload,
+                10,
+            )
+            .await;
+            assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        }
+
+        let mut store = Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap();
+        store.blobstore = Some(Arc::new(UnreachableBlobStore(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let store = Arc::new(store);
+        let st = idle_stream(
+            &store,
+            "s/local",
+            idle_cfg(Some(TierAfterIdle::Secs(1))),
+            &payload,
+            10,
+        )
+        .await;
+        let sidecar_before = std::fs::read(meta_path(&st.file_path)).unwrap();
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 0);
+
+        assert_eq!(
+            std::fs::read(meta_path(&st.file_path)).unwrap(),
+            sidecar_before,
+            "the pass changed the sidecar"
+        );
+        assert_stayed_local(&dir, &st, len);
+        assert!(files_under(&dir.join("segments")).is_empty());
+        assert_eq!(read_logical(&st, 0, len).await, payload);
+        let more = b"written during the outage".to_vec();
+        append_wire(&st, &more).await;
+        let mut all = payload.clone();
+        all.extend_from_slice(&more);
+        assert_eq!(read_logical(&st, 0, all.len() as u64).await, all);
+
+        // The stream in S3 resolves to remote slices only, and S3 refuses them.
+        let cold = store.get("s/cold").unwrap();
+        let mut slices = Vec::new();
+        resolve_range(&cold, 0, len, &mut slices);
+        assert!(!slices.is_empty());
+        let bs = store.blobstore.clone().unwrap();
+        for slice in slices {
+            let ResolvedSlice::Remote { key, offset, len } = slice else {
+                panic!("a moved byte was served from the SSD");
+            };
+            assert!(bs.get_range(&key, offset, len).await.is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #v-tail-after-s3: an append to a stream whose data file is empty after
+    /// a move lands in its local file, takes no object-store request (its
+    /// post-append pass seals nothing by size), reads back after the S3 bytes
+    /// at the next offset, and moves in turn when it goes idle.
+    #[tokio::test]
+    async fn append_after_a_move_is_local_and_moves_when_idle_in_turn() {
+        let dir = tmp_dir("idle-tail");
+        let mut store = Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap();
+        let counting = Arc::new(CountingBlobStore::new(&dir));
+        store.blobstore = Some(counting.clone());
+        let store = Arc::new(store);
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let st = idle_stream(
+            &store,
+            "s/tail",
+            idle_cfg(Some(TierAfterIdle::Secs(1))),
+            &payload,
+            10,
+        )
+        .await;
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_moved(&dir, &st, len);
+        let pieces = st.tier.manifest.lock().unwrap().segments.len();
+
+        // More than a segment: size sealing would take it.
+        let requests = counting.count();
+        let more: Vec<u8> = (0..100 * 1024).map(|i| (i % 13) as u8).collect();
+        append_wire(&st, &more).await;
+        store.maybe_seal(&st).await;
+        assert_eq!(counting.count(), requests, "the append reached the object store");
+        assert_eq!(st.tier.manifest.lock().unwrap().segments.len(), pieces);
+        assert_eq!(st.tier.manifest.lock().unwrap().sealed_offset, len);
+        assert_eq!(data_file_len(&st), more.len() as u64);
+        let tail = len + more.len() as u64;
+        assert!(all_local(&st, len, tail));
+        assert_eq!(read_logical(&st, len, tail).await, more);
+        let mut all = payload.clone();
+        all.extend_from_slice(&more);
+        assert_eq!(read_logical(&st, 0, tail).await, all);
+
+        // The new tail is not idle yet; once it is, it moves after the S3 bytes.
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 0);
+        assert_eq!(data_file_len(&st), more.len() as u64);
+        age_data_file(&st, 10);
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_moved(&dir, &st, tail);
+        assert_eq!(read_logical(&st, 0, tail).await, all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #v-reaper-with-tier, second half (#c-expiring-not-uploaded): the pass
+    /// never uploads a stream that expires within its next idle time, by
+    /// `Stream-TTL` or by `Stream-Expires-At`.
+    #[tokio::test]
+    async fn idle_pass_never_uploads_a_stream_that_expires_within_its_idle_time() {
+        let dir = tmp_dir("idle-expiring");
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), idle_tier(&dir, Some(60))).unwrap());
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let mut ttl = idle_cfg(None);
+        ttl.ttl_seconds = Some(30);
+        let ttl = idle_stream(&store, "s/ttl", ttl, &payload, 120).await;
+        let mut at = idle_cfg(None);
+        at.expires_at = Some(SystemTime::now() + Duration::from_secs(30));
+        let at = idle_stream(&store, "s/expires-at", at, &payload, 120).await;
+        let mut later = idle_cfg(None);
+        later.ttl_seconds = Some(3600);
+        let later = idle_stream(&store, "s/later", later, &payload, 120).await;
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+        assert_stayed_local(&dir, &ttl, len);
+        assert_stayed_local(&dir, &at, len);
+        assert_moved(&dir, &later, len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fence that lands while a piece uploads (a DELETE racing the pass)
+    /// leaves the piece unlisted: the pass removes the object it just made,
+    /// drops nothing and leaves the sidecar as it was.
+    #[tokio::test]
+    async fn idle_move_lists_nothing_when_the_fence_lands_during_the_upload() {
+        let dir = tmp_dir("idle-fence");
+        let fencing = Arc::new(FencesOnPut {
+            inner: crate::blobstore::LocalFsBlobStore::new(dir.join("cold")).unwrap(),
+            stream: StdMutex::new(None),
+        });
+        let mut store = Store::new_with_tier(dir.clone(), idle_tier(&dir, None)).unwrap();
+        let shared: crate::blobstore::SharedBlobStore = fencing.clone();
+        store.blobstore = Some(shared);
+        let store = Arc::new(store);
+        let payload = idle_payload();
+        let len = payload.len() as u64;
+        let st = idle_stream(
+            &store,
+            "s/racing",
+            idle_cfg(Some(TierAfterIdle::Secs(1))),
+            &payload,
+            10,
+        )
+        .await;
+        let sidecar_before = std::fs::read(meta_path(&st.file_path)).unwrap();
+        *fencing.stream.lock().unwrap() = Some(Arc::clone(&st));
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 0);
+        *fencing.stream.lock().unwrap() = None;
+
+        assert!(st.is_fenced());
+        assert_eq!(std::fs::read(meta_path(&st.file_path)).unwrap(), sidecar_before);
+        assert_stayed_local(&dir, &st, len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------- batched meta sweep tests (#4691) ----------------

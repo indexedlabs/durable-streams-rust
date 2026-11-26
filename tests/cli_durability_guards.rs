@@ -632,6 +632,218 @@ fn delete_mode_removes_an_expired_tiered_stream_from_the_ssd_and_the_bucket() {
     drop(server);
 }
 
+/// The body of a raw HTTP/1.1 response, de-chunked when it was sent chunked.
+#[cfg(feature = "tier")]
+fn response_body(response: &str) -> String {
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no body in: {response}"));
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let (size, after) = rest.split_once("\r\n").expect("chunk size line");
+        let size = usize::from_str_radix(size.trim(), 16).expect("chunk size");
+        if size == 0 {
+            return out;
+        }
+        out.push_str(&after[..size]);
+        rest = &after[size + 2..];
+    }
+}
+
+/// The idle pass with the S3 tier against a local S3 (OTTO-14141): a stream
+/// with a 1-second idle time is moved to the bucket, its data file is left
+/// empty, its bytes read back the same from offset 0 and from a middle offset,
+/// and an append after the move reads back after them. A stream that expires
+/// within its idle time is never uploaded. Ignored by default; CI's `tier` job
+/// runs it against moto's server. By hand, as for the test above:
+///
+///   DS_S3_BUCKET=ds-tier-test DS_S3_ACCESS_KEY_ID=… DS_S3_SECRET_ACCESS_KEY=… \
+///   cargo test --features tier --test cli_durability_guards \
+///     idle_pass_moves_an_idle_stream_to_the_bucket -- --ignored
+#[cfg(feature = "tier")]
+#[test]
+#[ignore]
+fn idle_pass_moves_an_idle_stream_to_the_bucket_and_reads_it_back() {
+    use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
+
+    let endpoint = "http://127.0.0.1:9000".to_string();
+    let bucket = std::env::var("DS_S3_BUCKET").unwrap_or_else(|_| "ds-tier-test".into());
+    let mut builder = AmazonS3Builder::new()
+        .with_endpoint(endpoint.clone())
+        .with_region("us-east-1")
+        .with_bucket_name(bucket.clone())
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false);
+    if let (Ok(key), Ok(secret)) = (
+        std::env::var("DS_S3_ACCESS_KEY_ID"),
+        std::env::var("DS_S3_SECRET_ACCESS_KEY"),
+    ) {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let s3 = builder.build().expect("test S3 client");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let exists = |key: &str| {
+        rt.block_on(async {
+            match s3.head(&ObjPath::from(key)).await {
+                Ok(_) => true,
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(error) => panic!("head {key}: {error}"),
+            }
+        })
+    };
+
+    let dir = std::env::temp_dir().join(format!("ds-rust-idle-tier-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let prefix = format!(
+        "ds-idle-e2e-{}-{}/",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let extra: Vec<String> = [
+        "--tier",
+        "s3",
+        "--tier-endpoint",
+        endpoint.as_str(),
+        "--tier-region",
+        "us-east-1",
+        "--tier-bucket",
+        bucket.as_str(),
+        "--tier-key-prefix",
+        prefix.as_str(),
+        "--tier-path-style",
+        "--tier-allow-http",
+        "--tier-segment-bytes",
+        "4096",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let server = ServerUnderTest::wal(&dir, &extra);
+
+    let create = |path: &str, headers: &str| {
+        let created = server.request(&format!(
+            "PUT {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: text/plain\r\n{headers}Content-Length: 0\r\n\r\n"
+        ));
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    };
+    let append = |path: &str, body: &str| {
+        let appended = server.request(&format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        assert!(appended.starts_with("HTTP/1.1 2"), "{appended}");
+    };
+    let read_from = |path: &str, offset: usize| {
+        let read = server.request(&format!(
+            "GET {path}?offset=0000000000000000_{offset:016} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(read.starts_with("HTTP/1.1 200"), "{read}");
+        response_body(&read)
+    };
+
+    let payload: String = (0..20 * 1024)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    create("/idle", "Stream-Tier-After-Idle: 1\r\n");
+    append("/idle", &payload);
+    // Due by its data file's age, but it expires within its idle time.
+    create(
+        "/expiring",
+        "Stream-Tier-After-Idle: 100\r\nStream-TTL: 50\r\n",
+    );
+    append("/expiring", &payload);
+
+    // Each stream's sidecar (by its recorded path) and data file.
+    let streams = dir.join("streams");
+    let files_of = |path: &str| -> (serde_json::Value, std::path::PathBuf) {
+        for entry in std::fs::read_dir(&streams).expect("streams directory").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(data_name) = name.strip_suffix(".meta") else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if meta["path"].as_str() == Some(path) {
+                return (meta, streams.join(data_name));
+            }
+        }
+        panic!("no sidecar for {path}");
+    };
+    let remote_keys = |meta: &serde_json::Value| -> Vec<String> {
+        meta["segments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|segment| segment["remote_key"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (_, expiring_data) = files_of("/expiring");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&expiring_data)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(200))
+        .unwrap();
+
+    let moved = || {
+        let (meta, data) = files_of("/idle");
+        std::fs::metadata(&data).unwrap().len() == 0
+            && meta["sealed_offset"].as_u64() == Some(payload.len() as u64)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !moved() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(moved(), "the idle stream was not moved: {}", files_of("/idle").0);
+    let (meta, _) = files_of("/idle");
+    let keys = remote_keys(&meta);
+    assert_eq!(keys.len(), payload.len() / 4096, "{meta}");
+    for key in &keys {
+        assert!(key.starts_with(&prefix), "{key}");
+        assert!(exists(key), "piece {key} is not in the bucket");
+    }
+
+    // Reads keep their offsets: from 0, and from a middle offset.
+    assert_eq!(read_from("/idle", 0), payload);
+    assert_eq!(read_from("/idle", 10_000), payload[10_000..]);
+
+    // An append after the move is a new local tail after the S3 bytes.
+    let more = "written after the move";
+    append("/idle", more);
+    let (_, data) = files_of("/idle");
+    assert_eq!(std::fs::metadata(&data).unwrap().len(), more.len() as u64);
+    assert_eq!(read_from("/idle", 0), format!("{payload}{more}"));
+    assert_eq!(read_from("/idle", payload.len()), more);
+
+    // Passes ran meanwhile; the expiring stream is still wholly local.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let (meta, data) = files_of("/expiring");
+    assert!(remote_keys(&meta).is_empty(), "uploaded: {meta}");
+    assert_eq!(std::fs::metadata(&data).unwrap().len(), payload.len() as u64);
+    drop(server);
+}
+
 #[test]
 fn delete_mode_reaps_an_expired_stream_without_a_request_to_that_path() {
     let temp = tempfile::tempdir().unwrap();

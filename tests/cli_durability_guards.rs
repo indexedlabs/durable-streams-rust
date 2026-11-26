@@ -1430,6 +1430,26 @@ fn tier_after_idle_secs_rejects_a_value_that_is_not_seconds() {
 }
 
 #[test]
+fn tier_idle_move_rate_refuses_zero_and_a_value_that_is_not_a_number() {
+    for (value, message) in [
+        ("0", "--tier-idle-move-rate must be at least 1"),
+        ("fast", "--tier-idle-move-rate got an invalid value"),
+        ("-1", "--tier-idle-move-rate got an invalid value"),
+        ("2.5", "--tier-idle-move-rate got an invalid value"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args: Vec<String> = ["--data-dir", dir.path().to_str().unwrap()]
+            .map(str::to_string)
+            .to_vec();
+        args.extend(TIER_S3.map(str::to_string));
+        args.extend(["--tier-idle-move-rate", value].map(str::to_string));
+        let (code, stderr) = startup_outcome(&args);
+        assert_eq!(code, Some(2), "{value}: {stderr}");
+        assert!(stderr.contains(message), "{value}: {stderr}");
+    }
+}
+
+#[test]
 fn tier_after_idle_secs_is_accepted_with_tier_s3() {
     let dir = std::env::temp_dir().join("ds-rust-cli-guard-tier-after-idle");
     let _ = std::fs::remove_dir_all(&dir);

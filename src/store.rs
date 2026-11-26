@@ -5501,7 +5501,7 @@ mod tier_tests {
         let mut cfg = idle_cfg(Some(TierAfterIdle::Secs(1)));
         cfg.content_type = "application/json".into();
         let mut wire = Vec::new();
-        for i in 0..3000 {
+        for i in 0..6000 {
             wire.extend_from_slice(format!("{{\"n\":{i},\"s\":\"a,b]\"}},").as_bytes());
         }
         let long_at = wire.len() as u64;

@@ -4832,6 +4832,7 @@ mod tier_tests {
             &'a self,
             _key: &'a str,
             _body: bytes::Bytes,
+            _sha256: crate::blobstore::Sha256Digest,
         ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
             Box::pin(async { Err(std::io::Error::other("bucket unreachable")) })
         }
@@ -5052,11 +5053,12 @@ mod tier_tests {
             &'a self,
             key: &'a str,
             body: bytes::Bytes,
+            sha256: crate::blobstore::Sha256Digest,
         ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
             if let Some(st) = self.stream.lock().unwrap().as_ref() {
                 st.fenced.store(true, std::sync::atomic::Ordering::Release);
             }
-            self.inner.put(key, body)
+            self.inner.put(key, body, sha256)
         }
         fn get_range<'a>(
             &'a self,

@@ -463,6 +463,7 @@ fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
 
 /// How fast the idle pass goes.
 #[cfg(test)]
+#[allow(dead_code)] // the stub reads neither field
 #[derive(Clone, Copy, Debug)]
 pub struct IdlePace {
     /// Streams checked before each one-second pause.

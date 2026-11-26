@@ -6171,6 +6171,107 @@ mod tier_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A blobstore that records how many pieces it was handed and the largest.
+    struct LargestPutBlobStore {
+        inner: crate::blobstore::LocalFsBlobStore,
+        puts: std::sync::atomic::AtomicUsize,
+        largest: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::blobstore::BlobStore for LargestPutBlobStore {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: bytes::Bytes,
+            sha256: crate::blobstore::Sha256Digest,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.largest
+                .fetch_max(body.len(), std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(key, body, sha256)
+        }
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            start: u64,
+            len: u64,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+            self.inner.get_range(key, start, len)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
+            self.inner.head(key)
+        }
+        fn delete<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// With `--tier-segment-bytes 1099511627776` (the guard that keeps size
+    /// sealing off), a stream with its own idle time still moves in pieces of
+    /// at most 8 MiB, the most the pass reads at once, and a stream with no
+    /// idle time is neither sealed by size nor moved.
+    #[tokio::test]
+    async fn idle_pieces_stay_at_most_8_mib_under_a_one_tib_segment_size() {
+        const TIB: u64 = 1_099_511_627_776;
+        const PIECE: u64 = crate::tier::IDLE_PIECE_MAX;
+        assert_eq!(PIECE, 8 * 1024 * 1024);
+        let dir = tmp_dir("idle-piece-cap");
+        let blob = Arc::new(LargestPutBlobStore {
+            inner: crate::blobstore::LocalFsBlobStore::new(dir.join("cold")).unwrap(),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+            largest: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, TIB)).unwrap();
+        let shared: crate::blobstore::SharedBlobStore = blob.clone();
+        store.blobstore = Some(shared);
+        let store = Arc::new(store);
+        let payload: Vec<u8> = (0..(2 * PIECE + 1024 * 1024))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let len = payload.len() as u64;
+        let own = idle_stream(
+            &store,
+            "s/own-idle",
+            idle_cfg(Some(TierAfterIdle::Secs(1))),
+            &payload,
+            10,
+        )
+        .await;
+        let none = idle_stream(&store, "s/no-idle", idle_cfg(None), &payload, 10).await;
+        // The post-append pass of a stream with no idle time seals nothing.
+        store.maybe_seal(&none).await;
+        assert!(none.tier.manifest.lock().unwrap().segments.is_empty());
+
+        assert_eq!(store.idle_pass(IdlePace::unpaced()).await, 1);
+
+        let lens: Vec<u64> = own
+            .tier
+            .manifest
+            .lock()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.len)
+            .collect();
+        assert_eq!(lens, vec![PIECE, PIECE, len - 2 * PIECE]);
+        assert_eq!(blob.puts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            blob.largest.load(std::sync::atomic::Ordering::SeqCst) as u64,
+            PIECE,
+            "a piece larger than 8 MiB was read and uploaded"
+        );
+        assert_eq!(data_file_len(&own), 0);
+        assert_eq!(read_logical(&own, 0, len).await, payload);
+        assert_stayed_local(&dir, &none, len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #v-tail-after-s3: an append to a stream whose data file is empty after
     /// a move lands in its local file, takes no object-store request (its
     /// post-append pass seals nothing by size), reads back after the S3 bytes

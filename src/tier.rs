@@ -53,10 +53,9 @@ const IDLE_CHECKS_PER_SEC: usize = 1_000;
 /// Pause between the end of one idle pass and the start of the next.
 const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Largest `--tier-segment-bytes` startup accepts with `--tier s3`: the
-/// segment size is also the idle pass's piece size, and each piece is read
-/// whole into memory.
-pub const MAX_SEGMENT_BYTES_WITH_S3: u64 = 1024 * 1024 * 1024;
+/// Largest piece the idle pass uploads, and reads into memory at once,
+/// whatever `--tier-segment-bytes` is (a larger value only sets the size seal).
+pub const IDLE_PIECE_MAX: u64 = 8 * 1024 * 1024;
 
 /// Where a sealed segment's bytes currently live.
 #[derive(Clone, Debug)]
@@ -745,7 +744,7 @@ impl Store {
     /// Upload what the stream holds only on the SSD: first any segment sealed
     /// earlier and still `Local` (through `offload_one`), then its durable
     /// bytes above the sealed offset, read from its data file in pieces of up
-    /// to `segment_bytes`. Each piece goes up under `<key prefix><data
+    /// to `segment_bytes`, and never more than [`IDLE_PIECE_MAX`]. Each piece goes up under `<key prefix><data
     /// file>/<start offset>` with its SHA-256 and, only once the object store
     /// has accepted it, is listed in the manifest as remote and the sidecar
     /// written durably. A failed upload changes nothing; a crash before the
@@ -776,7 +775,7 @@ impl Store {
             let payload = tokio::fs::read(&path).await?;
             self.offload_one(st, start, bytes::Bytes::from(payload)).await?;
         }
-        let seg_bytes = self.tier_config.segment_bytes.max(1);
+        let seg_bytes = self.tier_config.segment_bytes.clamp(1, IDLE_PIECE_MAX);
         // Bytes appended from here on are a new tail, left for a later pass.
         let end = st.shared.read().unwrap().durable_tail;
         loop {
